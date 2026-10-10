@@ -1,4 +1,0 @@
-file 'E:/laotuo_project/Modal_ComfyUI/pipeline/output/videos/shot_01.mp4'
-file 'E:/laotuo_project/Modal_ComfyUI/pipeline/output/videos/shot_02.mp4'
-file 'E:/laotuo_project/Modal_ComfyUI/pipeline/output/videos/shot_03.mp4'
-file 'E:/laotuo_project/Modal_ComfyUI/pipeline/output/videos/shot_04.mp4'
