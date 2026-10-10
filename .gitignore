@@ -21,6 +21,10 @@ pipeline/output/
 *.jpeg
 *.zip
 
+# Agent skills：h3-prompt-writing 按 skills-lock.json 自行安装；编剧技能由使用者自备
+.agents/
+_h3/
+
 # VS Code / IDE
 .vscode/
 .idea/

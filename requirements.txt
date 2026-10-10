@@ -1,0 +1,7 @@
+# 本地 Web 界面与流水线依赖（Modal 云端镜像的依赖写在 h3_diffusers_service.py / comfyui_minimax_h3_modal.py 中）
+# 建议在验证可用后用 `pip freeze` 把版本锁定为 == 精确版本
+gradio>=5.0
+modal
+python-dotenv
+requests
+Pillow

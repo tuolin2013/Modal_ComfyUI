@@ -3,15 +3,14 @@
 使用 right.codes「draw」令牌 + 图像模型生成：
   1. 角色定妆照：每个角色一张，作为 Ref2VA 参考图锁定全片人物长相
   2. per-shot 静态基底图：用于确认构图（纯文生视频镜头）
-Base URL：https://www.right.codes/v1
+Base URL：https://www.rightapi.ai/v1
 
-截图中可见的图像模型（按质量/价格排序）：
-  - gpt-image-2.5          高质量，OpenAI 出品，$0.06/张
-  - gpt-image-2.5-flare    gpt-image-2.5 变体（不可用，备选）
+可选图像模型（以平台模型列表和计价为准）：
+  - gpt-image-2.5          高质量
   - gpt-image-2.5-sunburst gpt-image-2.5 变体
-  - nano-banana            Google 出品，极速廉价，适合批量草稿
-  - nano-banana-2          Google 出品，中等质量
-  - nano-banana-2-lite     Google 出品，$0.05/张，最便宜
+  - nano-banana            极速廉价，适合批量草稿
+  - nano-banana-2          中等质量
+  - nano-banana-2-lite     最便宜，草图模式使用
 
 带货场景推荐：
   - 商品棚拍精图 → gpt-image-2.5
@@ -33,7 +32,7 @@ load_dotenv(Path(__file__).parent / ".env")
 
 # ── right.codes 接入配置 ─────────────────────────────────────────────────────
 # 在 .env 文件中设置（参见 pipeline/.env.example）：
-#   RIGHT_CODES_DRAW_KEY=sk-...    # 「draw」令牌（截图 sk***73）
+#   RIGHT_CODES_DRAW_KEY=sk-...    # 「draw」画图令牌
 RIGHT_CODES_BASE_URL = "https://www.rightapi.ai/v1"
 RIGHT_CODES_DRAW_KEY = os.environ.get("RIGHT_CODES_DRAW_KEY", "")
 
@@ -41,7 +40,7 @@ RIGHT_CODES_DRAW_KEY = os.environ.get("RIGHT_CODES_DRAW_KEY", "")
 DEFAULT_IMAGE_MODEL = os.environ.get("IMAGE_MODEL", "gpt-image-2.5")
 
 # 带货竖版：1024×1792；横版/正方：1024×1024
-DEFAULT_SIZE = os.environ.get("IMAGE_SIZE", "1024×1792")  # 9:16 竖屏
+DEFAULT_SIZE = os.environ.get("IMAGE_SIZE", "1024x1792")  # 9:16 竖屏
 
 # 角色定妆照固定竖版，便于容纳全身
 PORTRAIT_SIZE = "1024x1792"

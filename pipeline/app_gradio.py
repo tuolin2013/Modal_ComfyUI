@@ -40,7 +40,8 @@ PROMPTS_DIR = OUTPUT_DIR / "prompts"
 VIDEO_DIR = OUTPUT_DIR / "videos"
 FINAL_VIDEO = VIDEO_DIR / "final_commercial.mp4"
 
-COMFYUI_URL = "https://tuolin2011--comfyui-minimax-h3-ui-dev.modal.run"
+# 模式 A 的 ComfyUI 地址，在 pipeline/.env 中配置；为空时界面不显示跳转按钮
+COMFYUI_URL = os.environ.get("COMFYUI_URL", "").strip()
 T2V_MODES = {"T2VA", "T2V"}
 MODAL_APP = "minimax-h3-diffusers-service"  # 与 h3_diffusers_service.APP_NAME 一致
 
@@ -986,7 +987,10 @@ def render_shot_card(sb, shot, char_names, scene_names):
                 "参考图按右侧 Picture 编号顺序接入，顺序错了人物和产品会对调。"
                 f"种子统一填 `{(sb.get('meta') or {}).get('seed', '随机')}`，全片画风更一致。"
             )
-            gr.Button("🔗 打开 Modal ComfyUI 页面", link=COMFYUI_URL, size="sm")
+            if COMFYUI_URL:
+                gr.Button("🔗 打开 Modal ComfyUI 页面", link=COMFYUI_URL, size="sm")
+            else:
+                gr.Markdown("未配置 `COMFYUI_URL`：部署 `comfyui_minimax_h3_modal.py` 后把地址写进 `pipeline/.env`。")
 
 
 with gr.Blocks(title="AI 带货内容全链路流水线", **BLOCKS_KW) as demo:

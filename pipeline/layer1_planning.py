@@ -1,13 +1,12 @@
 """
 层 1 · 策划层
 使用 right.codes LLM API 将商品卖点 → 带货分镜 JSON
-right.codes 兼容 OpenAI 协议，直接使用 openai SDK 即可
+right.codes 兼容 OpenAI 协议，这里直接用 requests 调用 /chat/completions
 
-Base URL（来自平台令牌管理页）：https://www.right.codes
-OpenAI SDK 需要加 /v1 后缀：  https://www.right.codes/v1
+Base URL：https://www.rightapi.ai/v1（OpenAI 兼容的 /chat/completions）
 令牌分工：
-  - Claude awsq key → 策划层 LLM 调用（RIGHT_CODES_LLM_KEY）
-  - draw key        → 视觉资产层生图调用（RIGHT_CODES_DRAW_KEY）
+  - LLM key  → 策划层 LLM 调用（RIGHT_CODES_LLM_KEY）
+  - draw key → 视觉资产层生图调用（RIGHT_CODES_DRAW_KEY）
 """
 
 import json
@@ -17,7 +16,6 @@ import re
 import time
 import requests
 from pathlib import Path
-from openai import OpenAI
 
 # 加载 pipeline/.env
 from dotenv import load_dotenv
@@ -28,8 +26,7 @@ load_dotenv(Path(__file__).parent / ".env")
 RIGHT_CODES_BASE_URL = "https://www.rightapi.ai/v1"
 RIGHT_CODES_LLM_KEY = os.environ.get("RIGHT_CODES_LLM_KEY", "")
 
-# 策划层：使用 Claude awsq 高质量令牌对应的模型
-# 请确保此处的模型名称在 right.codes 是真实存在的，例如 claude-3-5-sonnet-20240620 或 gpt-4o
+# 策划层模型：必须是平台上可用的模型名，可在 .env 的 PLANNING_MODEL 中修改
 PLANNING_MODEL = os.environ.get("PLANNING_MODEL", "claude-opus-5-5")
 
 # LLM 单次请求的读取超时（秒）和重试次数。长输出（完整剧本 / 25 张图文策划）常超过 2 分钟
