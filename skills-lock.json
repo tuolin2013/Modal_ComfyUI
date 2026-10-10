@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "h3-prompt-writing": {
+      "source": "MiniMax-AI/MiniMax-H3",
+      "sourceType": "github",
+      "skillPath": "skills/h3-prompt-writing/SKILL.md",
+      "computedHash": "e5712d549cd8ee5a3ae5249d984d65b70a14ec9e66e5ec37fe818384c2837e1e"
+    }
+  }
+}

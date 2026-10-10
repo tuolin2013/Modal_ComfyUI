@@ -1,0 +1,139 @@
+{
+  "product": {
+    "name": "猫静宝（肖爷爷老中医）",
+    "usp": [
+      "发情期陪它安稳过渡（首乌藤、远志、葛根、甘草植物配伍）",
+      "鸡肝风味片，喂片不用掰嘴",
+      "持证生产可查，喂着安心（鄂饲预（2023）12001）",
+      "配料表透明，首乌藤远志看得见",
+      "猫狗通用，用量清楚好掌握（猫每天2片，犬每5kg体重1片/天）"
+    ],
+    "brand_color": "#C8A882"
+  },
+  "script": {
+    "title": "凌晨两点的第三次敲门",
+    "logline": "独居女孩被发情期嚎叫的猫和敲门的邻居逼到崩溃，喂片又被挠，一盒鸡肝味植物片让猫自己凑过来吃，也让邻居的消息从投诉变成了问候。",
+    "characters": [
+      {
+        "id": "C1",
+        "name": "林小满",
+        "role": "独居租房的年轻铲屎官，未给猫绝育",
+        "appearance_zh": "28岁中国女性，鹅蛋脸，齐肩黑色直发自然散开、略显凌乱，素颜，眼下有淡淡黑眼圈；穿宽松浅灰色纯棉长袖睡衣套装，领口和袖口有白色滚边；左手腕戴一根细黑色发圈；身材纤瘦。",
+        "appearance_en": "a 28-year-old East Asian Chinese woman, oval face, shoulder-length straight black hair worn loose and slightly messy, no makeup, faint dark circles under the eyes, wearing an oversized light grey cotton long-sleeve pajama set with thin white piping on the collar and cuffs, a thin black hair tie on her left wrist, slim build",
+        "image_path": "./pipeline/output/assets/characters\\C1_portrait.png",
+        "image_source": "generated"
+      },
+      {
+        "id": "C2",
+        "name": "橘子",
+        "role": "林小满养的未绝育母猫",
+        "appearance_zh": "成年橘色虎斑短毛母猫，琥珀色眼睛，胸口和四只爪子为白色，体型偏瘦，戴一条细细的灰粉色布项圈，无铃铛。",
+        "appearance_en": "an adult female orange tabby domestic shorthair cat, amber eyes, white chest patch and four white paws, slim body, wearing a thin dusty-pink fabric collar with no bell",
+        "image_path": "./pipeline/output/assets/characters\\C2_portrait.png",
+        "image_source": "generated"
+      }
+    ],
+    "scenes": [
+      {
+        "id": "S1",
+        "name": "出租屋卧室·深夜",
+        "description_en": "a small rental apartment bedroom at 2 a.m., cold blue moonlight through sheer white curtains, a warm dim bedside lamp casting amber light, beige linen bedding on a low wooden bed, a smartphone on a light oak nightstand, a white wooden door visible in the background, color palette of muted blue and warm beige"
+      },
+      {
+        "id": "S2",
+        "name": "出租屋客厅·傍晚",
+        "description_en": "a compact rental apartment living room in the early evening, warm tungsten ceiling light, a light grey fabric sofa with a beige throw blanket, a low oak coffee table, a cat scratching post in the corner, soft warm beige and grey color palette"
+      },
+      {
+        "id": "S3",
+        "name": "产品棚拍台面",
+        "description_en": "a minimalist product studio set, a warm natural oak tabletop, seamless warm beige backdrop in brand color #C8A882, soft golden key light from the left with a slow sweeping rim light, a few scattered dried herbal slices as subtle props, shallow depth of field, premium calm atmosphere"
+      }
+    ],
+    "full_text": "【镜头1｜S1 出租屋卧室·深夜｜开场钩子】\n凌晨两点。漆黑的卧室里只亮着一盏昏黄床头灯。橘子趴在床尾地板上翘着屁股打滚，张嘴拖长音嚎叫。\n林小满猛地从被窝里坐起，头发凌乱，双手捂住耳朵。门外传来「咚咚咚」三声敲门，床头手机亮起，屏幕弹出邻居消息：「能不能让你家猫别叫了？？」\n林小满（画外音，崩溃）：凌晨两点，邻居第三次来敲门了……\n\n【镜头2｜S2 出租屋客厅·傍晚｜使用场景】\n第二天傍晚。林小满跪坐在沙发前，一手把橘子夹在怀里，一手捏着它的嘴往里塞药片。橘子扭头蹬腿，一爪子挠在她手背上，「呸」地把药片吐到地毯上，跳下沙发跑开。\n林小满看着手背上的红印，叹气瘫坐在地上。\n林小满（画外音，无奈）：喂个片像打仗，掰嘴被挠，最后还吐了。\n\n【镜头3｜S3 产品棚拍台面｜卖点展示】\n转场：画面从地毯上那片被吐掉的药片，硬切到暖米色台面。\n猫静宝包装盒静静立在橡木台面上，盒前摆着三片圆形风味片。一道金色扫光从左向右缓缓划过盒面，品牌名「肖爷爷老中医」「猫静宝」依次亮起，镜头缓慢推近到片剂表面颗粒质感。\n画外音（温和）：鸡肝味的植物片，首乌藤远志写得明明白白。\n\n【镜头4｜S1 出租屋卧室·深夜｜行动召唤】\n几天后的同一时间，凌晨两点。卧室同样只亮着床头灯，却一片安静。橘子蜷在林小满枕边，尾巴圈住身子安稳打着呼噜。林小满侧躺着，伸手轻轻摸了摸橘子的头，嘴角上扬。床头手机亮起，邻居消息：「最近安静多了，睡得真香」。林小满对着镜头比了个「嘘」，笑出声。\n林小满（画外音，轻松）：现在它自己凑来吃，一盒三十片，先试试。"
+  },
+  "product_refs": [
+    {
+      "id": "Ref1",
+      "desc": "猫静宝包装盒正面45°斜侧角度，盒子直立摆放，盒前平放3片片剂；纯白或浅米色背景，柔和均匀光线无强反光；「肖爷爷老中医」「猫静宝」品牌名及正面文字、图案清晰可读，片剂颜色和表面纹理清晰；竖版构图，主体居中。",
+      "used_in": [
+        3
+      ],
+      "image_path": "E:\\laotuo_project\\Modal_ComfyUI\\pipeline\\output\\user_product_refs\\Ref1.jpg"
+    }
+  ],
+  "shots": [
+    {
+      "id": 1,
+      "duration_sec": 4.0,
+      "mode": "Ref2VA",
+      "voiceover": "凌晨两点，邻居第三次来敲门了……",
+      "visual_intent": "竖屏9:16，深夜冷蓝月光+昏黄床头灯的冷暖对比。前景床尾地板上橘子翘臀打滚张嘴嚎叫，中景林小满从被窝里猛然坐起捂住耳朵，背景白色房门；床头手机屏幕亮起邻居投诉消息。人物居中，画面上下各留约15%字幕区。第1秒即出现嚎叫+敲门声，制造强钩子。",
+      "camera": "Push In, small amplitude, fast speed, handheld slight shake, from the yowling cat in the foreground to the woman's startled face",
+      "emotion_beat": "开场钩子",
+      "image_gen_prompt": "Vertical 9:16 cinematic frame, a small rental apartment bedroom at 2 a.m., cold blue moonlight through sheer white curtains, a warm dim bedside lamp casting amber light, beige linen bedding on a low wooden bed, a smartphone on a light oak nightstand, a white wooden door visible in the background, color palette of muted blue and warm beige. In the foreground on the floor at the foot of the bed, an adult female orange tabby domestic shorthair cat, amber eyes, white chest patch and four white paws, slim body, wearing a thin dusty-pink fabric collar with no bell, rolling on her back with mouth wide open mid-yowl. In the center, a 28-year-old East Asian Chinese woman, oval face, shoulder-length straight black hair worn loose and slightly messy, no makeup, faint dark circles under the eyes, wearing an oversized light grey cotton long-sleeve pajama set with thin white piping on the collar and cuffs, a thin black hair tie on her left wrist, slim build, sitting bolt upright in bed covering her ears with both hands, exhausted and desperate expression. The phone screen on the nightstand glows with an incoming message notification. Subject centered, clear empty space at top and bottom for subtitles, realistic film grain, shallow depth of field, short drama style.",
+      "ref_needed": null,
+      "characters": [
+        "C1",
+        "C2"
+      ],
+      "scene": "S1",
+      "image_path": ""
+    },
+    {
+      "id": 2,
+      "duration_sec": 4.5,
+      "mode": "Ref2VA",
+      "voiceover": "喂个片像打仗，掰嘴被挠，最后还吐了。",
+      "visual_intent": "竖屏9:16，暖黄客厅灯光。林小满跪坐在灰色沙发前，把橘子夹在怀里掰嘴塞片，橘子扭头蹬腿一爪挠向她手背，把片剂吐到地毯上后跳开。结尾停在她看着手背红印、瘫坐叹气的表情。动作集中在画面中部，上下留字幕区。片剂为普通白色药片，不出现本产品。",
+      "camera": "Static Shot, medium close-up, slight Pan right with small amplitude and medium speed following the cat as it jumps away",
+      "emotion_beat": "使用场景",
+      "image_gen_prompt": "Vertical 9:16 cinematic frame, a compact rental apartment living room in the early evening, warm tungsten ceiling light, a light grey fabric sofa with a beige throw blanket, a low oak coffee table, a cat scratching post in the corner, soft warm beige and grey color palette. A 28-year-old East Asian Chinese woman, oval face, shoulder-length straight black hair worn loose and slightly messy, no makeup, faint dark circles under the eyes, wearing an oversized light grey cotton long-sleeve pajama set with thin white piping on the collar and cuffs, a thin black hair tie on her left wrist, slim build, kneeling in front of the sofa, holding an adult female orange tabby domestic shorthair cat, amber eyes, white chest patch and four white paws, slim body, wearing a thin dusty-pink fabric collar with no bell, trying to push a plain white pill into the struggling cat's mouth; the cat twists its head away and swipes a paw at her hand, a plain white pill falling onto the beige rug. Frustrated, helpless expression on the woman. Subject centered, clear space at top and bottom for subtitles, realistic lighting, natural motion blur on the paw, short drama style.",
+      "ref_needed": null,
+      "characters": [
+        "C1",
+        "C2"
+      ],
+      "scene": "S2",
+      "image_path": ""
+    },
+    {
+      "id": 3,
+      "duration_sec": 4.5,
+      "mode": "Ref2VA",
+      "voiceover": "鸡肝味的植物片，首乌藤远志写得明白。",
+      "visual_intent": "B-Roll切入方式：由镜头2地毯上被吐掉的白色药片做匹配剪辑，硬切到暖米色（#C8A882）棚拍台面。产品盒刚体静止直立居中，盒前三片风味片平放；一道金色扫光从左至右缓慢划过盒面，依次照亮品牌名，随后微距缓推至片剂表面颗粒质感，侧景点缀少量干草本切片暗示植物配伍。产品全程不动、不变形，只有光在动；上下留字幕区，可叠加「首乌藤·远志·葛根·甘草」「鸡肝风味」字幕。",
+      "camera": "Push In, small amplitude, slow speed, macro lens, from the full product box to the surface texture of the tablets, with a slow left-to-right light sweep across the box; product remains completely static",
+      "emotion_beat": "卖点展示",
+      "image_gen_prompt": "Vertical 9:16 premium product macro shot, a minimalist product studio set, a warm natural oak tabletop, seamless warm beige backdrop in brand color #C8A882, soft golden key light from the left with a slow sweeping rim light, a few scattered dried herbal slices as subtle props, shallow depth of field, premium calm atmosphere. The Mao Jing Bao pet supplement box by Xiao Yeye Lao Zhongyi stands upright, perfectly static and rigid, centered in frame, matching the reference product exactly; the packaging text, brand name, logo, colors, graphics and box proportions strictly adhere to the reference image with no distortion or invented text. Three round flavored tablets lie flat in front of the box, their color, size and fine granular surface texture strictly matching the reference image. A cinematic golden light sweep glides across the box surface creating a crisp specular highlight on the edges, rich micro detail of the matte paper printing, warm amber tones, ultra sharp focus on the product, 8K commercial photography quality, clear empty space at top and bottom for subtitles.",
+      "ref_needed": "Ref1",
+      "characters": [],
+      "scene": "S3",
+      "image_path": ""
+    },
+    {
+      "id": 4,
+      "duration_sec": 5.0,
+      "mode": "Ref2VA",
+      "voiceover": "现在它自己凑来吃，一盒三十片，先试试。",
+      "visual_intent": "竖屏9:16，与镜头1同一卧室同一机位、同为凌晨两点，形成前后反转对照：画面安静，床头灯暖光为主。橘子蜷在林小满枕边打呼噜，林小满侧躺轻抚猫头，嘴角上扬；床头手机亮起邻居消息「最近安静多了，睡得真香」。最后她对镜头比「嘘」并笑出声。产品不入画，购买理由由口播带出，可在底部字幕区叠加购物车引导。",
+      "camera": "Pull Out, small amplitude, slow speed, from a close-up of the sleeping cat to a medium shot revealing the smiling woman and the glowing phone message",
+      "emotion_beat": "行动召唤",
+      "image_gen_prompt": "Vertical 9:16 cinematic frame, a small rental apartment bedroom at 2 a.m., cold blue moonlight through sheer white curtains, a warm dim bedside lamp casting amber light, beige linen bedding on a low wooden bed, a smartphone on a light oak nightstand, a white wooden door visible in the background, color palette of muted blue and warm beige, the warm lamp light now dominant and cozy. An adult female orange tabby domestic shorthair cat, amber eyes, white chest patch and four white paws, slim body, wearing a thin dusty-pink fabric collar with no bell, curled up asleep beside the pillow with her tail wrapped around her body. A 28-year-old East Asian Chinese woman, oval face, shoulder-length straight black hair worn loose and slightly messy, no makeup, faint dark circles under the eyes, wearing an oversized light grey cotton long-sleeve pajama set with thin white piping on the collar and cuffs, a thin black hair tie on her left wrist, slim build, lying on her side gently stroking the cat's head, relaxed relieved smile. The phone on the nightstand glows softly with a friendly message notification. Peaceful, warm, healing mood, subject centered, clear space at top and bottom for subtitles, soft film grain, short drama style.",
+      "ref_needed": null,
+      "characters": [
+        "C1",
+        "C2"
+      ],
+      "scene": "S1",
+      "image_path": ""
+    }
+  ],
+  "meta": {
+    "story_template": "经典反转 · 4镜",
+    "platform": "抖音/快手（竖版 9:16）",
+    "aspect_ratio": "9:16",
+    "image_size": "1024x1792",
+    "seed": 1834160067
+  }
+}

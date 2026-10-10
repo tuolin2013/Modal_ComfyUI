@@ -1,0 +1,170 @@
+"""
+产品信息 → LLM 卖点分析
+
+用户填写产品信息（名称、类目、描述/参数、目标人群、价格区间、真实背书），
+LLM 提炼：用户痛点、核心卖点（按说服力排序）、差异化、目标人群画像、使用场景。
+结果在页面上可直接修改，或重新分析；视频剧本和主图/详情页策划都基于这份分析。
+
+原则：只从用户提供的信息里提炼，不编造参数、数据、认证和评价。
+"""
+
+import json
+import os
+import re
+import time
+from pathlib import Path
+
+import requests
+
+from layer1_planning import RIGHT_CODES_BASE_URL, RIGHT_CODES_LLM_KEY, PLANNING_MODEL, LLM_TIMEOUT
+
+BRIEF_PATH = Path(__file__).resolve().parent / "output" / "product_brief.json"
+
+# 页面字段：用户输入
+INPUT_FIELDS = ("name", "category", "description", "audience", "price", "endorsements", "brand_color")
+# 页面字段：LLM 分析结果（用户可改）
+ANALYSIS_FIELDS = ("usp", "pain_points", "differentiation", "persona", "scenes")
+
+DEFAULT_BRIEF = {
+    "name": "某某玻尿酸原液精华",
+    "category": "美妆护肤 · 精华",
+    "description": "1000万分子玻尿酸，水感质地，3秒渗透不油腻，30ml 滴管瓶",
+    "audience": "",
+    "price": "",
+    "endorsements": "",
+    "brand_color": "#C8A882",
+    "usp": "1000万分子玻尿酸\n3秒渗透不油腻",
+    "pain_points": "",
+    "differentiation": "",
+    "persona": "",
+    "scenes": "",
+}
+
+ANALYZE_SYSTEM = """\
+你是资深电商操盘手兼品牌策划，擅长从产品信息中提炼能打动用户的卖点。
+
+【任务】根据用户提供的产品信息，输出：
+1. pain_points：目标用户在这个品类上的真实困扰，1-3 条，用用户的口吻（如"涂完黏腻，上妆搓泥"）
+2. usp：核心卖点 3-5 条，按说服力从强到弱排序。每条 ≤ 16 字，讲用户能感知的利益和结果，
+   最好能对应一个痛点；参数只作为支撑，写在利益后面（如"3 秒吸收不黏腻（水感质地）"）
+3. differentiation：与同类产品相比最核心的 1 个差异点，一句话
+4. persona：目标人群画像，一句话（年龄段/身份/场景/诉求）
+5. scenes：典型使用场景 2-4 个
+
+【硬性规则】
+1. 只从用户提供的信息中提炼和推理，不编造参数、成分含量、检测数据、认证、销量和用户评价。
+   用户没给的数字不要写数字。
+2. 背书只能引用用户在"真实背书"里提供的内容。
+3. 遵守《广告法》：不用极限词（最、第一、唯一、顶级、国家级、100% 等），不做医疗功效宣称。
+4. 信息不足以支撑某项时，写出合理推断，并在 notes 里提示用户补充什么信息。
+
+输出纯 JSON：
+{"pain_points": ["..."], "usp": ["..."], "differentiation": "...", "persona": "...",
+ "scenes": ["..."], "notes": "需要用户补充或核实的信息，没有则留空"}
+"""
+
+
+def load_brief() -> dict:
+    try:
+        data = json.loads(BRIEF_PATH.read_text(encoding="utf-8"))
+        return {**DEFAULT_BRIEF, **{k: v for k, v in data.items() if isinstance(v, str)}}
+    except (OSError, json.JSONDecodeError):
+        return dict(DEFAULT_BRIEF)
+
+
+def save_brief(brief: dict):
+    BRIEF_PATH.parent.mkdir(parents=True, exist_ok=True)
+    BRIEF_PATH.write_text(json.dumps(brief, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def lines_of(text: str) -> list[str]:
+    """多行文本 → 列表，去掉空行和行首的序号/项目符号"""
+    out = []
+    for line in str(text or "").splitlines():
+        line = re.sub(r"^\s*(?:[-*·•]|\d+[.、)）])\s*", "", line).strip()
+        if line:
+            out.append(line)
+    return out
+
+
+def _input_text(brief: dict) -> str:
+    rows = [
+        ("商品名称", brief.get("name")),
+        ("类目", brief.get("category")),
+        ("产品描述 / 参数 / 特性", brief.get("description")),
+        ("目标人群（用户填写）", brief.get("audience")),
+        ("价格区间", brief.get("price")),
+        ("真实背书（证书/专利/检测/销量等）", brief.get("endorsements")),
+        ("用户已有的卖点想法", brief.get("usp")),
+    ]
+    return "\n".join(f"{k}：{v.strip()}" for k, v in rows if v and str(v).strip())
+
+
+def analyze_product(brief: dict) -> tuple[dict, str]:
+    """调用 LLM 分析卖点，返回 (分析结果字段 dict, 给用户的提示 notes)"""
+    if not str(brief.get("name", "")).strip():
+        raise ValueError("请先填写商品名称")
+
+    old_np = os.environ.pop("NO_PROXY", None)
+    old_np_l = os.environ.pop("no_proxy", None)
+    try:
+        resp = None
+        for attempt in range(3):
+            try:
+                resp = requests.post(
+                    f"{RIGHT_CODES_BASE_URL.rstrip('/')}/chat/completions",
+                    headers={"Authorization": f"Bearer {RIGHT_CODES_LLM_KEY}",
+                             "Content-Type": "application/json", "Connection": "close"},
+                    json={"model": PLANNING_MODEL, "temperature": 0.6, "max_tokens": 3000,
+                          "response_format": {"type": "json_object"},
+                          "messages": [{"role": "system", "content": ANALYZE_SYSTEM},
+                                       {"role": "user", "content": _input_text(brief)}]},
+                    timeout=LLM_TIMEOUT,
+                )
+                if resp.status_code < 500:
+                    break
+            except requests.exceptions.RequestException:
+                if attempt == 2:
+                    raise
+            time.sleep(5)
+    finally:
+        if old_np is not None:
+            os.environ["NO_PROXY"] = old_np
+        if old_np_l is not None:
+            os.environ["no_proxy"] = old_np_l
+
+    if resp is None or resp.status_code != 200:
+        raise Exception(f"LLM 请求失败 ({getattr(resp, 'status_code', '-')}): {getattr(resp, 'text', '')[:500]}")
+    raw = resp.json()["choices"][0]["message"]["content"].strip()
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
+    data = json.loads(raw)
+
+    def join(v):
+        if isinstance(v, list):
+            return "\n".join(str(x).strip() for x in v if str(x).strip())
+        return str(v or "").strip()
+
+    result = {
+        "usp": join(data.get("usp")),
+        "pain_points": join(data.get("pain_points")),
+        "differentiation": join(data.get("differentiation")),
+        "persona": join(data.get("persona")),
+        "scenes": join(data.get("scenes")),
+    }
+    return result, join(data.get("notes"))
+
+
+def brief_context(brief: dict) -> str:
+    """把产品信息 + 卖点分析整理成一段文字，注入视频剧本和图文策划的提示词"""
+    rows = [
+        ("类目", brief.get("category")),
+        ("产品描述 / 参数", brief.get("description")),
+        ("价格区间", brief.get("price")),
+        ("目标人群", brief.get("persona") or brief.get("audience")),
+        ("用户痛点", brief.get("pain_points")),
+        ("差异化", brief.get("differentiation")),
+        ("使用场景", brief.get("scenes")),
+        ("真实背书（只能引用这里的内容，没有的不要编）", brief.get("endorsements")),
+    ]
+    body = "\n".join(f"{k}：{str(v).strip()}" for k, v in rows if v and str(v).strip())
+    return f"【产品分析（用户已确认）】\n{body}" if body else ""
