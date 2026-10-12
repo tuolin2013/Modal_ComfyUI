@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="zh-CN" class="tone-{{ tone }} pos-{{ position }}{% if tag %} has-tag{% endif %}">
+<head>
+<meta charset="utf-8">
+<style>
+{% if font_regular %}
+@font-face { font-family: "EcomSans"; src: url("{{ font_regular }}"); font-weight: 100 599; }
+{% endif %}
+{% if font_bold %}
+@font-face { font-family: "EcomSans"; src: url("{{ font_bold }}"); font-weight: 600 1000; }
+{% endif %}
+:root {
+  --accent: {{ colors.accent }};
+  --on-accent: {{ colors.on_accent }};
+  --accent-text: {{ colors.accent_text }};
+  --head: {{ colors.head }};
+  --text: {{ colors.text }};
+  --sub: {{ colors.sub }};
+  --scrim: {{ colors.scrim }};
+  --panel: {{ colors.panel }};
+  --line: {{ colors.line }};
+  --scrim-a: .78;
+  --k: 1;
+  /* 1rem = 画面宽度的 1%；放不下时 ecomLayout() 调小 --k 整体缩字 */
+  font-size: calc({{ width }}px / 100 * var(--k));
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { width: {{ width }}px; height: {{ height }}px; overflow: hidden; }
+body {
+  position: relative;
+  font-family: "EcomSans", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", "Source Han Sans SC",
+               "WenQuanYi Micro Hei", sans-serif;
+  color: var(--text);
+  line-break: strict;          /* 中文标点避头尾 */
+  word-break: normal;
+  overflow-wrap: anywhere;     /* 超长英文 / 数字串也能折行，不撑出画面 */
+  -webkit-font-smoothing: antialiased;
+}
+.base { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+
+/* 渐隐色带：保证文字可读又不生硬，高度由 ecomLayout() 按文字块实际高度设定 */
+.scrim { position: absolute; left: 0; right: 0; height: 40%; pointer-events: none; }
+.pos-top .scrim {
+  top: 0;
+  background: linear-gradient(to bottom, rgba(var(--scrim), var(--scrim-a)) 0%,
+              rgba(var(--scrim), calc(var(--scrim-a) * .7)) 50%, rgba(var(--scrim), 0) 100%);
+}
+.pos-bottom .scrim {
+  bottom: 0;
+  background: linear-gradient(to top, rgba(var(--scrim), var(--scrim-a)) 0%,
+              rgba(var(--scrim), calc(var(--scrim-a) * .7)) 50%, rgba(var(--scrim), 0) 100%);
+}
+
+.zone { position: absolute; left: 0; right: 0; display: flex; flex-direction: column; }
+.pos-top .zone { top: 0; }
+.pos-bottom .zone { bottom: 0; }
+.fit { font-size: calc(var(--size) * var(--s, 1)); }
+.tone-dark .shadow { text-shadow: 0 .15rem .9rem rgba(0, 0, 0, .55); }
+{% block style %}{% endblock %}
+</style>
+</head>
+<body>
+<img class="base" src="{{ base_src }}" alt="">
+<div class="scrim"></div>
+<div class="zone" data-max-height="{{ zone_max }}">
+{% block content %}{% endblock %}
+</div>
+{% block overlay %}{% endblock %}
+<script>
+// 截图前由 Playwright 调用：等字体和底图就绪 → 超行或超出留白区时逐步缩字 → 返回仍放不下的提示
+window.ecomLayout = async () => {
+  const STEP = 0.04, MIN_LINE_SCALE = 0.75, MIN_ZONE_SCALE = 0.8;
+  const warnings = [];
+  await Promise.all([...document.fonts].map(f => f.load().catch(() => null)));
+  await document.fonts.ready;
+  if ([...document.fonts].some(f => f.status === 'error')) warnings.push('字体文件加载失败，已用系统字体');
+  try { await document.querySelector('.base').decode(); } catch (e) { warnings.push('底图加载失败'); }
+
+  const root = document.documentElement;
+  const zone = document.querySelector('.zone');
+  const limit = Number(zone.dataset.maxHeight);
+  const fits = [...zone.querySelectorAll('[data-max-lines]')];
+  const lines = el => Math.round(el.getBoundingClientRect().height / parseFloat(getComputedStyle(el).lineHeight));
+  const tooLong = el => lines(el) > Number(el.dataset.maxLines);
+  const outside = () => [...document.querySelectorAll('.zone *, .corner')].some(el => {
+    const r = el.getBoundingClientRect();
+    return r.left < -1 || r.right > innerWidth + 1;
+  });
+  const round = v => Math.round(v * 100) / 100;
+
+  let k = 1;
+  for (;;) {
+    root.style.setProperty('--k', k);
+    for (const el of fits) {
+      let s = 1;
+      el.style.setProperty('--s', s);
+      while (tooLong(el) && s > MIN_LINE_SCALE) { s = round(s - STEP); el.style.setProperty('--s', s); }
+    }
+    if ((zone.offsetHeight <= limit && !outside()) || k <= MIN_ZONE_SCALE) break;
+    k = round(k - STEP);
+  }
+
+  for (const el of fits) if (tooLong(el)) warnings.push(`${el.dataset.label}超过 ${el.dataset.maxLines} 行`);
+  if (zone.offsetHeight > limit) warnings.push('文字超出预留的留白区，可能压到产品，建议精简文案');
+  if (outside()) warnings.push('有文字超出画面宽度，建议精简文案');
+  document.querySelector('.scrim').style.height = Math.min(innerHeight, zone.offsetHeight + innerHeight * 0.12) + 'px';
+  return { warnings, scale: k };
+};
+</script>
+</body>
+</html>

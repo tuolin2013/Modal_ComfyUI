@@ -147,12 +147,14 @@ Continuity (this shot is one part of a multi-shot commercial; each shot is rende
 {context or "- (no extra context)"}
 
 Constraints:
-1. Timing must fit exactly {duration:.2f} seconds.
+1. Timing must fit exactly {duration:.2f} seconds; any timestamp you write must be within it.
 2. Keep one continuous shot; do not describe cuts inside it.
 {ref_rule}
-4. The voiceover MUST be spoken by a character (S1) or off-screen voiceover (S1). Put the exact Chinese text inside <d>[Chinese] ...</d>.
+4. The voiceover MUST be spoken by a character (S1) or off-screen voiceover (S1). Put the exact Chinese text inside <d>[Chinese] ...</d>, word for word.
 5. Do NOT output markdown code blocks around the final prompt. Just output the raw prompt text directly.
 6. Every character listed under Continuity must be described with the exact appearance text given, so all shots render the same person.
+7. Do NOT ask for any on-screen text, subtitles, captions, price tags or logo animations; text is added in post-production.
+8. Use exactly these sections, in this order: {", ".join(REF_SECTIONS if is_ref else BASE_SECTIONS)}.
 """
 
     headers = {
@@ -205,11 +207,17 @@ Constraints:
             raise Exception(f"API请求失败 ({resp.status_code}): {resp.text[:300]}")
 
         text = _strip_code_fence(resp.json()["choices"][0]["message"]["content"] or "")
-        problem = check_picture_tags(text, n_refs)
+        problem = check_picture_tags(text, n_refs) or check_prompt_structure(text, is_ref, voiceover, duration)
         if not problem:
             return text
         last_err = problem
         print(f"[层3] 镜头 {shot['id']} [{attempt + 1}/{LLM_RETRIES}] 提示词不合格：{problem}，重新生成...")
+        # 把问题告诉模型再写一次，比原样重试更容易改对
+        payload["messages"] = payload["messages"][:2] + [
+            {"role": "assistant", "content": text},
+            {"role": "user", "content": f"The prompt above fails a check: {problem}. "
+                                        "Rewrite the complete prompt and fix this, keeping everything else."},
+        ]
 
     raise Exception(f"镜头 {shot['id']} 的 H3 提示词生成失败：{last_err}")
 
@@ -217,6 +225,59 @@ Constraints:
 def rendered_seconds(duration_sec) -> float:
     """与 app_gradio.duration_to_frames 一致的实际渲染时长（帧数 / 24）"""
     return duration_to_frames(duration_sec) / RENDER_FPS
+
+
+# h3-prompt-writing 规范要求的段落（顺序见 references/base-en.txt、ref-en.txt）
+BASE_SECTIONS = ("integrated_multimodal_description", "overall_soundscape", "non_diegetic_music")
+REF_SECTIONS = ("subject_definitions", "summary", "retention_analysis", "detailed_description",
+                "overall_soundscape", "non_diegetic_music")
+# 要求模型在画面里写字的说法：H3 画出来的中文基本是乱码，字幕和花字留给后期。
+# 「留出字幕区（space for subtitles）」是给后期留位置，不算
+_ON_SCREEN_TEXT = re.compile(
+    r"\b(?:on-screen|onscreen)\s+(?:text|caption|title)s?\b|\bsubtitles?\s+(?:read|reads|say|says|show|shows|appear)|"
+    r"\bcaptions?\s+(?:read|say|show|appear)|\btext\s+overlay\b|\b(?:title|text)\s+(?:card|appears|reads)\b|"
+    r"\bwords?\s+appear\b|\b(?:display|displays|showing|shows)\s+(?:the\s+)?(?:text|words|slogan)\b", re.I)
+# H3 规范的时间写法：00:03.500（分:秒.毫秒）。只认这种格式，避免把画幅 9:16 当成时间点
+_TIMESTAMP = re.compile(r"\b(\d{2}):(\d{2}\.\d{1,3})\b")
+
+
+def _norm_speech(text: str) -> str:
+    """比对口播时忽略空白和标点（模型常把「……」改成「...」）"""
+    return re.sub(r"[\s\W_]+", "", str(text or ""))
+
+
+def check_prompt_structure(text: str, is_ref: bool, voiceover: str = "", duration: float | None = None) -> str:
+    """
+    按 h3-prompt-writing 规范校验提示词结构，返回问题描述；合格返回空串。
+    只查能确定的硬问题：段落缺失、口播没原样放进 <d>、要求画面写字、时间轴超出时长。
+    """
+    lowered = text.lower()
+    sections = REF_SECTIONS if is_ref else BASE_SECTIONS
+    missing = [s for s in sections if not re.search(rf"^\s*{s}\s*:", text, flags=re.M | re.I)]
+    if missing:
+        return f"缺少规范要求的段落：{', '.join(missing)}"
+    positions = [re.search(rf"^\s*{s}\s*:", text, flags=re.M | re.I).start() for s in sections]
+    if positions != sorted(positions):
+        return f"段落顺序不对，应为 {' → '.join(sections)}"
+
+    if _norm_speech(voiceover):
+        spoken = "".join(re.findall(r"<d>(.*?)</d>", text, flags=re.S))
+        spoken = re.sub(r"\[[^\]]*\]", "", spoken)          # 去掉 [Chinese] 语言标签
+        if _norm_speech(voiceover) not in _norm_speech(spoken):
+            return "口播没有原样放进 <d>[Chinese] ...</d>（H3 会念错或漏念台词）"
+
+    m = _ON_SCREEN_TEXT.search(text)
+    if m:
+        return f"要求在画面里出现文字（「{m.group(0)}」），H3 画不出正确的中文，字幕留给后期"
+
+    if duration:
+        for mm, ss in _TIMESTAMP.findall(text):
+            t = int(mm) * 60 + float(ss)
+            if t > duration + 0.05:
+                return f"时间点 {mm}:{ss} 超出镜头时长 {duration:.2f} 秒"
+    if "```" in lowered:
+        return "输出里带了 markdown 代码块"
+    return ""
 
 
 def check_picture_tags(text: str, n_refs: int) -> str:

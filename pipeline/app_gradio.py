@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import inspect
 import random
 import shutil
 import subprocess
@@ -23,13 +24,18 @@ load_dotenv(PIPELINE_DIR / ".env")
 # 导入 Pipeline 层
 from layer1_planning import (
     generate_storyboard, save_storyboard,
-    STORY_TEMPLATES, DEFAULT_TEMPLATE, PLATFORMS, DEFAULT_PLATFORM,
+    STORY_TEMPLATES, DEFAULT_TEMPLATE, PLATFORMS, DEFAULT_PLATFORM, CUSTOM_TEMPLATE, MIN_BEATS, MAX_BEATS,
+    parse_custom_beats,
     shot_references, duration_to_frames,
+    platform_duration, voiceover_limit, template_conflict,
 )
 from layer2_visual_assets import generate_all_shots, quick_draft, generate_character_portrait
 from layer3_h3_prompt import process_all_prompts
+import category_playbook as cp
 import ecom_images as ecom
 import product_brief as brief_mod
+import quality_check as qc
+import ui_theme as ui
 
 OUTPUT_DIR = PROJECT_ROOT / "pipeline" / "output"
 STORYBOARD_PATH = str(OUTPUT_DIR / "storyboard.json")
@@ -46,12 +52,15 @@ T2V_MODES = {"T2VA", "T2V"}
 MODAL_APP = "minimax-h3-diffusers-service"  # 与 h3_diffusers_service.APP_NAME 一致
 
 # ── Gradio 版本兼容 ───────────────────────────────────────────────────────────
-# Gradio 6 移除了 show_copy_button（改为 buttons=["copy"]），theme 也从 Blocks 移到了 launch()
+# Gradio 6 移除了 show_copy_button（改为 buttons=["copy"]），theme / css / js 也从 Blocks 移到了 launch()
 GRADIO_MAJOR = int(gr.__version__.split(".")[0])
 COPY_BTN = {"buttons": ["copy"]} if GRADIO_MAJOR >= 6 else {"show_copy_button": True}
-THEME = gr.themes.Soft()
-BLOCKS_KW = {} if GRADIO_MAJOR >= 6 else {"theme": THEME}
-LAUNCH_KW = {"theme": THEME} if GRADIO_MAJOR >= 6 else {}
+THEME = ui.THEME
+_UI_KW = {"theme": ui.THEME, "css": ui.CSS, "js": ui.FORCE_DARK_JS}
+BLOCKS_KW = {} if GRADIO_MAJOR >= 6 else _UI_KW
+LAUNCH_KW = _UI_KW if GRADIO_MAJOR >= 6 else {}
+# 运行日志放右侧固定侧栏（滚到哪里都看得到）；老版本 Gradio 没有右侧栏时退回页头下方一栏
+HAS_RIGHT_SIDEBAR = hasattr(gr, "Sidebar") and "position" in inspect.signature(gr.Sidebar.__init__).parameters
 
 # 帧数换算 duration_to_frames 在 layer1_planning（layer3 也要用，放这里会循环导入）
 
@@ -123,6 +132,13 @@ def missing_portraits(sb: dict) -> list[str]:
     return [c["id"] for c in characters_of(sb) if not _ready(c.get("image_path"))]
 
 
+def video_aspect_ratio(sb: dict) -> str:
+    """成片画幅：优先 meta.aspect_ratio，旧分镜没有时按 meta.platform 查平台表，再不行用默认平台"""
+    meta = (sb or {}).get("meta") or {}
+    plat = PLATFORMS.get(meta.get("platform")) or PLATFORMS[DEFAULT_PLATFORM]
+    return str(meta.get("aspect_ratio") or plat["aspect_ratio"])
+
+
 def delete_shot_videos(shot_ids):
     """参考图变了，用到它的镜头视频已过期"""
     for sid in shot_ids:
@@ -141,18 +157,85 @@ def err(e: Exception) -> str:
 
 
 def template_info(name: str) -> str:
+    if name == CUSTOM_TEMPLATE:
+        return (f"在下方逐行填写 {MIN_BEATS}–{MAX_BEATS} 个节拍，每行「节拍名 | A-Roll 或 B-Roll | 这一镜的任务」。"
+                "A-Roll 是人物镜头，B-Roll 是产品特写。")
     tpl = STORY_TEMPLATES.get(name)
     if not tpl:
         return ""
     beats = " → ".join(f"{b[0]}({b[1]})" for b in tpl["beats"])
-    return f"{tpl['desc']}\n\n**{len(tpl['beats'])} 个镜头：** {beats}"
+    return f"**{tpl['type']}** · {tpl['desc']}\n\n**{len(tpl['beats'])} 个镜头：** {beats}"
 
 
-def platform_info(name: str) -> str:
+def template_choices() -> list[tuple[str, str]]:
+    """剧本模板下拉框：按视频类型显示，最后是自定义节拍"""
+    return [(f"{t['type']} · {name}", name) for name, t in STORY_TEMPLATES.items()] + \
+           [("✍️ 自定义节拍（覆盖不到的场景）", CUSTOM_TEMPLATE)]
+
+
+def platform_info(name: str, template: str = "") -> str:
     p = PLATFORMS.get(name)
     if not p:
         return ""
-    return f"**画幅 {p['aspect_ratio']}**（基底图 {p['image_size']}）· {p['guide']}"
+    lo, hi = platform_duration(name)
+    text = (f"**画幅 {p['aspect_ratio']}**（基底图 {p['image_size']}）· 单镜 {lo:g}–{hi:g} 秒 · "
+            f"口播 ≤ {voiceover_limit(name)} 字/镜 · 推荐模板「{p['templates'][0]}」\n\n{p['guide']}")
+    conflict = template_conflict(name, template)
+    return text + (f"\n\n⚠️ {conflict}" if conflict else "")
+
+
+def on_platform_change(platform: str, template: str):
+    """换平台时：当前模板不适合新平台就切到推荐模板（适合的话保留用户的选择）"""
+    p = PLATFORMS.get(platform)
+    if p and template not in p["templates"]:
+        template = p["templates"][0]
+    return platform_info(platform, template), gr.update(value=template)
+
+
+def playbook_info(brief: dict) -> str:
+    key = cp.resolve(brief)
+    how = "手动选择" if brief.get("playbook") not in (None, "", cp.AUTO) and key == brief.get("playbook") else "自动识别"
+    if key == cp.GENERAL:
+        return (f"类目手册：**通用**（{how}；未匹配到类目）。可手动选择，"
+                "或在下方「新建自定义类目手册」让 AI 起草一份")
+    extra = f" · 继承「{cp.label(cp.parent_of(key))}」的合规底线" if cp.is_custom(key) else ""
+    return f"类目手册：**{cp.label(key)}**（{how}{extra}）· 买家关注：{cp.get(key)['focus']}"
+
+
+def run_draft_playbook(*brief_values):
+    """AI 起草自定义类目手册，填进编辑框（不保存）"""
+    brief = collect_brief(brief_values, save=False)
+    if not (brief.get("name") or brief.get("category")):
+        return "⚠️ 请先填写商品名称和类目", gr.skip()
+    try:
+        draft = brief_mod.draft_playbook(brief, ecom.DETAIL_ROLES)
+    except Exception as e:
+        return err(e), gr.skip()
+    text = json.dumps({**draft, "required": [list(r) for r in draft["required"]],
+                       "detail_overrides": {str(k): v for k, v in draft["detail_overrides"].items()}},
+                      ensure_ascii=False, indent=2)
+    return (f"🤖 已起草「{draft['label']}」手册（parent：{cp.label(draft['parent'])}）。"
+            "请核对买家关注点和风险词，改好后点「💾 保存并选用」。"), text
+
+
+def run_save_playbook(text):
+    try:
+        key = cp.save_custom(json.loads(text or "{}"))
+    except json.JSONDecodeError as e:
+        return f"⚠️ JSON 格式不对：{e}", gr.skip()
+    except ValueError as e:
+        return f"⚠️ {e}", gr.skip()
+    return (f"💾 已保存自定义类目手册「{cp.label(key)}」并选用。",
+            gr.update(choices=cp.choices(), value=key))
+
+
+def run_delete_playbook(key):
+    if not cp.is_custom(key):
+        return "⚠️ 只能删除自定义手册（下拉框里带 ⭐ 的）", gr.skip(), gr.skip()
+    name = cp.label(key)
+    cp.delete_custom(key)
+    return f"🗑️ 已删除自定义类目手册「{name}」，改回自动识别。", \
+        gr.update(choices=cp.choices(), value=cp.AUTO), ""
 
 
 # ── 编剧技能 ──────────────────────────────────────────────────────────────────
@@ -160,14 +243,20 @@ def platform_info(name: str) -> str:
 NON_SCREENWRITING_SKILLS = {"h3-prompt-writing"}
 # 注入 LLM 的技能文本总长度上限（字符），防止多选 + reference 撑爆上下文
 SKILL_CHAR_BUDGET = 60_000
+# 项目自带的技能（随仓库分发），默认选中；.agents/skills 下是用户自己放的技能
+BUILTIN_SKILLS_DIR = PIPELINE_DIR / "skills"
+DEFAULT_SKILLS = ("short-video-selling",)
 
 SKILL_MAP = {}  # label -> 技能目录 Path
-skills_dir = PROJECT_ROOT / ".agents" / "skills"
-if skills_dir.is_dir():
+for skills_dir in (BUILTIN_SKILLS_DIR, PROJECT_ROOT / ".agents" / "skills"):
+    if not skills_dir.is_dir():
+        continue
     for d in sorted(skills_dir.iterdir()):
         md_path = d / "SKILL.md"
         if not (d.is_dir() and md_path.exists()) or d.name in NON_SCREENWRITING_SKILLS:
             continue
+        if any(p.name == d.name for p in SKILL_MAP.values()):
+            continue  # 同名技能以项目自带的为准
         title = d.name
         try:
             with open(md_path, "r", encoding="utf-8") as f:
@@ -179,6 +268,7 @@ if skills_dir.is_dir():
             pass
         SKILL_MAP[f"{d.name} | {title}"] = d
 skill_choices = list(SKILL_MAP.keys())
+default_skills = [label for label, d in SKILL_MAP.items() if d.name in DEFAULT_SKILLS]
 
 
 def strip_frontmatter(text: str) -> str:
@@ -232,11 +322,24 @@ def load_skill_content(labels, include_refs: bool) -> tuple[str, list[str]]:
 BRIEF_FIELDS = brief_mod.INPUT_FIELDS + brief_mod.ANALYSIS_FIELDS
 
 
-def collect_brief(values) -> dict:
+def collect_brief(values, save: bool = True) -> dict:
     """按 BRIEF_FIELDS 顺序把页面输入组装成 dict，并保存（刷新页面后恢复）"""
     brief = {k: (str(v).strip() if v is not None else "") for k, v in zip(BRIEF_FIELDS, values)}
-    brief_mod.save_brief(brief)
+    brief["playbook"] = brief.get("playbook") or cp.AUTO
+    if save:
+        brief_mod.save_brief(brief)
     return brief
+
+
+def brief_check_report(brief: dict) -> str:
+    key = cp.resolve(brief)
+    return f"\n📚 类目手册：{cp.label(key)}" + qc.format_report("输入体检", qc.check_brief(brief, key))
+
+
+def run_brief_check(*values):
+    """输入体检：不调用 LLM，只看信息够不够"""
+    brief = collect_brief(values)
+    return "🩺 输入体检完成。" + brief_check_report(brief)
 
 
 def run_analyze(*values):
@@ -249,23 +352,45 @@ def run_analyze(*values):
         msg = "✅ 卖点分析完成，可直接修改下方结果，或补充产品信息后重新分析。"
         if notes:
             msg += f"\n📝 建议补充/核实：{notes}"
-        issues = ecom.check_compliance("\n".join(result.values()))
+        issues = qc.check_compliance("\n".join(result.values()), cp.resolve(brief), placeholders=False)
         if issues:
-            msg += f"\n⚠️ 广告法风险：{'、'.join(issues)}"
+            msg += f"\n⚠️ 广告法 / 类目合规风险：{'、'.join(issues)}"
+        msg += brief_check_report(brief)
         return [msg] + [result[k] for k in brief_mod.ANALYSIS_FIELDS]
     except Exception as e:
         return [err(e)] + [gr.skip()] * len(brief_mod.ANALYSIS_FIELDS)
 
 
 # ── 层 1：策划 ────────────────────────────────────────────────────────────────
-def run_layer1(story_template, platform, agent_skills, include_skill_refs, *brief_values):
+def concepts_summary(concepts: dict | None) -> str:
+    """运行日志里列出 3 个创意方向，标出选中的那个"""
+    items = (concepts or {}).get("concepts") or []
+    if not items:
+        return ""
+    chosen = concepts.get("chosen", 0)
+    lines = [f"\n💡 创意方向（选中第 {chosen + 1} 个{'：' + concepts['reason'] if concepts.get('reason') else ''}）："]
+    for i, c in enumerate(items):
+        mark = "👉" if i == chosen else "  "
+        risk = f" ⚠️ {'、'.join(c['compliance'])}" if c.get("compliance") else ""
+        lines.append(f"  {mark} {i + 1}. {c['angle']}（{c['score']} 分）钩子：{c['hook_line']}{risk}")
+    return "\n".join(lines)
+
+
+def run_layer1(story_template, platform, agent_skills, include_skill_refs, self_review, custom_beats,
+               concept_first, *brief_values):
     brief = collect_brief(brief_values)
     product_name = brief["name"]
     usps = brief_mod.lines_of(brief["usp"])
     if not product_name or not usps:
         return "⚠️ 请填写商品名称，并点「分析卖点」或手动填写核心卖点", load_storyboard()
+    if story_template == CUSTOM_TEMPLATE:
+        try:
+            parse_custom_beats(custom_beats)
+        except ValueError as e:
+            return f"⚠️ {e}", load_storyboard()
 
     skill_content, skill_skipped = load_skill_content(agent_skills, include_skill_refs)
+    playbook = cp.resolve(brief)
 
     try:
         storyboard = generate_storyboard(
@@ -273,9 +398,13 @@ def run_layer1(story_template, platform, agent_skills, include_skill_refs, *brie
             usp=usps,
             brand_color=brief["brand_color"],
             story_template=story_template,
+            custom_beats=custom_beats or "",
             target_platform=platform,
             agent_skill_content=skill_content,
             product_context=brief_mod.brief_context(brief),
+            playbook=playbook,
+            self_review=bool(self_review),
+            concept_first=bool(concept_first),
         )
         save_storyboard(storyboard, STORYBOARD_PATH)
     except Exception as e:
@@ -294,16 +423,25 @@ def run_layer1(story_template, platform, agent_skills, include_skill_refs, *brie
     if chars:
         msg += f"\n👤 {len(chars)} 个角色，定妆照将在层 2 自动生成（也可在「剧本」页上传真人照替换）。"
     if refs and ecom.get_product_images():
-        msg += (f"\n📸 剧本需要 {len(refs)} 张产品镜头图，执行「2️⃣ 生成定妆照 + 基底图」时会以顶部实拍图为参考自动生成"
+        msg += (f"\n📸 剧本需要 {len(refs)} 张产品镜头图，执行「2️⃣ 生成定妆照 + 基底图」时会以「📦 产品信息」页的实拍图为参考自动生成"
                 "（也可在「② 素材准备」逐张点「🤖 现在生成」先看效果）。")
     elif refs:
-        msg += f"\n📸 剧本需要 {len(refs)} 张产品镜头图，请先在页面顶部上传产品实拍图，AI 以它为参考生成。"
+        msg += f"\n📸 剧本需要 {len(refs)} 张产品镜头图，请先在「📦 产品信息」页上传产品实拍图，AI 以它为参考生成。"
     else:
         msg += "\n💡 本剧本没有真实产品入画的镜头，无需产品图。"
-    # 口播会直接念出来，同样要过广告法初筛
-    vo_issues = ecom.check_compliance("\n".join(str(s.get("voiceover") or "") for s in storyboard.get("shots", [])))
-    if vo_issues:
-        msg += f"\n⚠️ 口播广告法风险：{'、'.join(vo_issues)}（可在「剧本」页修改台词）"
+    # 硬校验（含口播的广告法 / 类目合规初筛）；自检开启时这是改过一轮之后的结果
+    msg += f"\n📚 类目手册：{cp.label(playbook)}"
+    if (storyboard.get("meta") or {}).get("self_reviewed"):
+        msg += " · 已按评分标准自检修改一轮"
+    elif self_review:
+        msg += " · 自检后问题没有减少，保留初稿"
+    msg += concepts_summary((storyboard.get("meta") or {}).get("concepts"))
+    if concept_first and not (storyboard.get("meta") or {}).get("concepts"):
+        msg += "\n💡 创意方向这一步没有成功，已直接生成分镜"
+    msg += qc.format_report("剧本检查", storyboard.get("quality_issues") or [])
+    conflict = template_conflict(platform, story_template)
+    if conflict:
+        msg += f"\n⚠️ {conflict}"
     if skill_content:
         msg += f"\n📚 已注入编剧技能 {len(agent_skills or [])} 个，共 {len(skill_content)} 字符。"
     if skill_skipped:
@@ -358,14 +496,14 @@ def _ref_gen_prompt(ref: dict, product_name: str, labels: list[str]) -> str:
 
 
 def generate_ref_image(ref_id: str, sb: dict | None = None, save: bool = True) -> str:
-    """以顶部产品实拍图为参考，按剧本 desc 生成 RefN 产品图；返回保存路径"""
+    """以「📦 产品信息」页的实拍图为参考，按剧本 desc 生成 RefN 产品图；返回保存路径"""
     sb = sb if sb is not None else load_storyboard()
     ref = next((r for r in sb.get("product_refs", []) if r.get("id") == ref_id), None)
     if ref is None:
         raise ValueError(f"当前剧本不需要 {ref_id}，请重新生成分镜")
     slots = ecom.product_slots()
     if not slots:
-        raise ValueError("请先在页面顶部上传产品实拍图")
+        raise ValueError("请先在「📦 产品信息」页上传产品实拍图")
     name = (sb.get("product") or {}).get("name") or brief_mod.load_brief().get("name", "")
     prompt = _ref_gen_prompt(ref, name, [label for _, _, label in slots])
 
@@ -467,7 +605,7 @@ def run_layer2(is_draft):
     if not os.path.exists(STORYBOARD_PATH):
         return "⚠️ 未找到分镜数据，请先执行【1. 策划层】", {}
 
-    # 剧本需要、还没有的产品图：以顶部实拍图为参考自动生成（先于 layer2，layer2 会读写同一份 storyboard）
+    # 剧本需要、还没有的产品图：以「📦 产品信息」页的实拍图为参考自动生成（先于 layer2，layer2 会读写同一份 storyboard）
     ref_done, ref_failed = generate_missing_refs()
 
     # 记录生成前的定妆照路径：草图定妆照被正式版替换后，用旧定妆照渲染的视频要作废
@@ -500,7 +638,7 @@ def run_layer2(is_draft):
     if left:
         msg += (f"\n⚠️ 产品镜头图 {', '.join(left)} 还没有，对应的 Ref2VA 镜头无法渲染。"
                 + ("请在「② 素材准备」点「🤖 现在生成」。" if ecom.get_product_images()
-                   else "请先在页面顶部上传产品实拍图，再点「🤖 现在生成」。"))
+                   else "请先在「📦 产品信息」页上传产品实拍图，再点「🤖 现在生成」。"))
 
     # H3 提示词在后台自动生成，供右侧卡片（模式 A 复制）和模式 B 使用。
     # 失败不影响底图结果，模式 B 启动时会再补生成。
@@ -550,6 +688,8 @@ def batch_render_with_diffusers(force_all=False, progress=gr.Progress()):
         meta["seed"] = random.randint(0, 2**31 - 1)
         write_storyboard(sb)
     seed = meta["seed"]
+    # 不传画幅时 H3 一律出 16:9，竖屏平台会变成横屏
+    aspect_ratio = video_aspect_ratio(sb)
     progress(0, desc="检查 / 补生成 H3 提示词")
     h3_err = ensure_h3_prompts()
     missing_prompts = [str(s.get("id")) for s in shots if not prompt_file_for(s).exists()]
@@ -601,8 +741,14 @@ def batch_render_with_diffusers(force_all=False, progress=gr.Progress()):
         )
 
     VIDEO_DIR.mkdir(parents=True, exist_ok=True)
-    if force_all:
+    # 镜头视频按画幅分批：画幅变了（含修复前一律按 16:9 渲染的旧视频），旧视频不能复用，
+    # 否则成片里横竖混拼，-c copy 拼接也会出错
+    ratio_mark = VIDEO_DIR / ".aspect_ratio"
+    old_ratio = ratio_mark.read_text(encoding="utf-8").strip() if ratio_mark.exists() else "16:9"
+    stale_ratio = old_ratio != aspect_ratio and any(VIDEO_DIR.glob("shot_*.mp4"))
+    if force_all or stale_ratio:
         clear_dir(VIDEO_DIR, "shot_*.mp4")
+    ratio_mark.write_text(aspect_ratio, encoding="utf-8")
 
     def video_of(sid):
         # 补零命名，保证 shot_10 排在 shot_09 之后
@@ -616,10 +762,18 @@ def batch_render_with_diffusers(force_all=False, progress=gr.Progress()):
     #    文件按镜头编号命名，拼接时仍按分镜顺序，不受渲染顺序影响
     order = sorted(todo, key=lambda j: (j[1] != "t2va", j[0]))
     for idx, (sid, wf, prompt, images, frames) in enumerate(order):
-        progress((idx, len(order)), desc=f"渲染镜头 {sid} ({wf})")
+        progress((idx, len(order)), desc=f"渲染镜头 {sid} ({wf} · {aspect_ratio})")
         try:
-            video_bytes = runners[wf].render_single_shot.remote(prompt, images or None, frames, seed)
+            video_bytes = runners[wf].render_single_shot.remote(
+                prompt, images or None, frames, seed, aspect_ratio=aspect_ratio)
         except Exception as e:
+            if "aspect_ratio" in str(e) and "unexpected keyword" in str(e):
+                # 线上还是旧版服务，后面的镜头也会同样失败，不必逐个再试
+                return (
+                    f"❌ Modal 上部署的 {MODAL_APP} 是旧版本，不支持画幅参数。\n"
+                    "请在项目根目录重新部署后再渲染：\n  modal deploy h3_diffusers_service.py",
+                    None,
+                )
             failures.append(f"镜头 {sid}: {e}")
             continue
         video_of(sid).write_bytes(video_bytes)
@@ -629,6 +783,8 @@ def batch_render_with_diffusers(force_all=False, progress=gr.Progress()):
     rendered = [video_of(j[0]) for j in jobs]
 
     warn = f"\n♻️ 复用已有视频 {skipped} 个镜头（勾选「全部重新渲染」可强制重渲）" if skipped else ""
+    if stale_ratio:
+        warn += f"\n🔁 画幅由 {old_ratio} 改为 {aspect_ratio}，旧镜头视频已作废并全部重渲"
     if missing_prompts:
         warn += f"\n⚠️ 镜头 {', '.join(missing_prompts)} 未能生成 H3 提示词，已回退使用 image_gen_prompt"
         if h3_err:
@@ -714,7 +870,7 @@ def ecom_product_note() -> str:
                 "换图后，视频里已生成的产品图不会自动更新，可在「② 素材准备」点重新生成。")
     fallback = ecom_product_images()
     if fallback:
-        return f"顶部未上传，主图/详情页沿用当前剧本里的 {len(fallback)} 张产品图。"
+        return f"「📦 产品信息」页未上传，主图/详情页沿用当前剧本里的 {len(fallback)} 张产品图。"
     return "⚠️ 还没有产品图，请至少上传 1 张，再生成剧本。"
 
 
@@ -730,31 +886,39 @@ def ecom_set_product(slot: int, file_path):
 
 
 def _plan_issue_summary(plan: dict) -> str:
+    playbook = (plan.get("meta") or {}).get("playbook")
     lines = []
     for it in plan.get("main_images", []) + plan.get("detail_sections", []):
-        issues = ecom.item_issues(it)
+        issues = ecom.item_issues(it, playbook)
         if issues:
             lines.append(f"  {it['id']}：{'、'.join(issues)}")
-    return ("\n⚠️ 文案待处理（禁用词/占位）：\n" + "\n".join(lines)) if lines else "\n✅ 文案未发现禁用词"
+    return (("\n⚠️ 文案待处理（禁用词/类目风险/占位）：\n" + "\n".join(lines)) if lines
+            else "\n✅ 文案未发现禁用词")
 
 
-def ecom_plan(platform, use_chars, main_count, main_ratio, *brief_values):
+def ecom_plan(platform, use_chars, main_count, main_ratio, self_review, *brief_values):
     try:
         brief = collect_brief(brief_values)
         usp = brief_mod.lines_of(brief["usp"])
         if not brief["name"]:
-            return "⚠️ 请先在顶部填写商品名称", gr.skip()
+            return "⚠️ 请先在「📦 产品信息」页填写商品名称", gr.skip()
         if not usp:
             return "⚠️ 请先点「分析卖点」或手动填写核心卖点", gr.skip()
         chars = list(ecom_portraits().values()) if use_chars else []
+        playbook = cp.resolve(brief)
         plan = ecom.generate_ecom_plan(brief["name"], usp, brief["brand_color"], platform, chars,
                                        main_count=int(main_count), main_ratio=main_ratio,
-                                       product_context=brief_mod.brief_context(brief))
+                                       product_context=brief_mod.brief_context(brief),
+                                       playbook=playbook, self_review=bool(self_review))
         ecom.reset_outputs()
         ecom.save_plan(plan)
+        reviewed = " · 已按评分标准自检修改一轮" if plan["meta"].get("self_reviewed") else \
+            (" · 自检后问题没有减少，保留初稿" if self_review else "")
         msg = (f"✅ 已策划 {len(plan['main_images'])} 张 {main_ratio} 主图 + "
                f"{len(plan['detail_sections'])} 张 3:4 详情页（{platform}）。"
-               f"\n请在右侧核对、修改文案，再点「生成全部图片」。" + _plan_issue_summary(plan))
+               f"\n📚 类目手册：{cp.label(playbook)}{reviewed}"
+               f"\n请在右侧核对、修改文案，再点「生成全部图片」。"
+               + qc.format_report("图文检查", plan.get("quality_issues") or []) + _plan_issue_summary(plan))
         return msg, plan
     except Exception as e:
         return err(e), gr.skip()
@@ -765,11 +929,12 @@ def _ecom_items(plan: dict):
            [("detail", it) for it in plan.get("detail_sections", [])]
 
 
-def ecom_generate_all(force=False, text_mode=ecom.DEFAULT_TEXT_MODE, progress=gr.Progress()):
+def ecom_generate_all(force=False, text_mode=ecom.DEFAULT_TEXT_MODE, check_fidelity=False, progress=gr.Progress()):
     """
     逐张生成（串行）。底图可复用的只重排文字、不再调用接口；失败后再点一次只补失败的。
     切换写字方式后，有文字的图会重新生成（底图里有没有字不同），白底图等无字图照常复用。
     生成器：每完成一张就把最新 plan 推给页面，右侧卡片逐张显示，不用等整套跑完。
+    check_fidelity：新生成的主图用视觉模型对比实拍图，核对包装文字 / logo / 配色（每张多一次调用）
     """
     plan = ecom.load_plan()
     if not plan.get("main_images"):
@@ -777,7 +942,7 @@ def ecom_generate_all(force=False, text_mode=ecom.DEFAULT_TEXT_MODE, progress=gr
         return
     products = ecom_product_images()
     if not products:
-        yield "⚠️ 请先在页面顶部上传产品实拍图", gr.skip()
+        yield "⚠️ 请先在「📦 产品信息」页上传产品实拍图", gr.skip()
         return
     portraits = ecom_portraits()
 
@@ -798,6 +963,8 @@ def ecom_generate_all(force=False, text_mode=ecom.DEFAULT_TEXT_MODE, progress=gr
                 ecom.render_item(plan, kind, it, products, portraits, text_mode)
                 generated += 1
                 service_fails = 0
+                if check_fidelity and kind == "main":
+                    ecom.check_product_fidelity(it, products)
         except ecom.ServiceError as e:
             print(f"[电商图] {it['id']} 失败：{e}")
             failed.append(f"{it['id']}：{e}")
@@ -818,6 +985,12 @@ def ecom_generate_all(force=False, text_mode=ecom.DEFAULT_TEXT_MODE, progress=gr
     check = "上架前请逐张核对产品包装文字/logo 是否与实物一致"
     if text_mode == "ai":
         check += "，并逐字核对 AI 写的中文（错字请改文案后点「重新生成画面」，或切换为程序叠字）"
+    layout = [f"  {it['id']}：{'；'.join(it['layout_warnings'])}" for _, it in items if it.get("layout_warnings")]
+    if layout:
+        check += "\n📐 排版提示（自动缩字后仍放不下，或文字区背景较杂）：\n" + "\n".join(layout)
+    fidelity = [f"  {it['id']}：{ecom.fidelity_note(it)}" for _, it in items if ecom.fidelity_note(it)]
+    if fidelity:
+        check += "\n" + "\n".join(fidelity)
     if failed:
         msg = f"❌ {len(failed)} 张失败：\n" + "\n".join(failed) + "\n\n" + msg + "\n再点一次「生成全部图片」只补失败的。"
     else:
@@ -825,10 +998,13 @@ def ecom_generate_all(force=False, text_mode=ecom.DEFAULT_TEXT_MODE, progress=gr
     yield msg + _plan_issue_summary(plan), ecom.load_plan()
 
 
-def ecom_save_item(kind, item_id, regen, headline, subline, badges, scene, text_mode=ecom.DEFAULT_TEXT_MODE):
+def ecom_save_item(kind, item_id, regen, headline, subline, badges, scene, text_mode=ecom.DEFAULT_TEXT_MODE,
+                   tag="", price_label="", price="", specs="", layout="standard", compare=""):
     """
     保存某张图的文案。regen=False：程序叠字的图只重排文字（免费）；AI 写字的图文字在画面里，只保存文案。
     regen=True：按当前写字方式重新生成画面。
+    tag：主图左上角角标 / 详情页标题上方小标签；price_label + price：主图价格标签；specs：详情页参数表（每行「名称：值」）
+    layout：详情页版式（standard / steps / grid / compare）；compare：对比表文本（首行「左列名｜右列名」，之后「项｜左｜右」）
     """
     try:
         plan = ecom.load_plan()
@@ -836,10 +1012,23 @@ def ecom_save_item(kind, item_id, regen, headline, subline, badges, scene, text_
         if not it:
             return "⚠️ 找不到这张图，请重新策划", gr.skip()
         lines = [l.strip() for l in (badges or "").splitlines() if l.strip()]
+        tag = (tag or "").strip()
+        layout_note = ""
         if kind == "main":
-            it.update(headline=headline.strip(), subline=subline.strip(), badges=lines[:3])
+            price = ecom.clean_price(price)
+            it.update(headline=headline.strip(), subline=subline.strip(), badges=lines[:3], tag=tag,
+                      price=price, price_label=(price_label or "").strip() if price else "")
         else:
-            it.update(title=headline.strip(), body=subline.strip(), bullets=lines[:4])
+            old_share = ecom.detail_share(it)
+            it.update(title=headline.strip(), body=subline.strip(), bullets=lines[:4], tag=tag,
+                      specs=ecom.normalize_specs(specs or ""), compare=ecom.normalize_compare(compare or ""))
+            it["icons"] = ecom.fill_icons(it.get("icons"), it["bullets"])
+            wanted = layout if layout in ecom.DETAIL_LAYOUTS else "standard"
+            it["layout"] = ecom.normalize_layout(wanted, it)
+            if it["layout"] != wanted:
+                layout_note = f"\n💡 内容不够「{ecom.DETAIL_LAYOUTS[wanted]}」用（步骤和网格至少 2 条要点，对比表至少 1 行），已按标准版式排"
+            if ecom.detail_share(it) > old_share and _ready(it.get("base_path")) and not regen:
+                layout_note += "\n💡 信息图需要更大的顶部留白，建议点「重新生成画面」，否则文字可能压到产品"
         it["scene_prompt_en"] = (scene or "").strip()
 
         if regen:
@@ -857,8 +1046,11 @@ def ecom_save_item(kind, item_id, regen, headline, subline, badges, scene, text_
             msg = f"✅ {item_id} 文案已保存（还没有底图，生成后生效）"
 
         ecom.save_plan(plan)
-        issues = ecom.item_issues(it)
-        return msg + (f"\n⚠️ {'、'.join(issues)}" if issues else ""), plan
+        issues = ecom.item_issues(it, (plan.get("meta") or {}).get("playbook"))
+        layout = it.get("layout_warnings") or []
+        return (msg + (f"\n⚠️ {'、'.join(issues)}" if issues else "")
+                + (f"\n📐 排版提示：{'；'.join(layout)}" if layout else "")
+                + layout_note), plan
     except Exception as e:
         return err(e), gr.skip()
 
@@ -879,54 +1071,89 @@ def ecom_export():
 
 
 def ecom_clear():
-    """清空本页的策划、底图、成品和产品图（顶部产品信息不动，已打包的 zip 保留）"""
+    """清空本页的策划、底图、成品和产品图（「📦 产品信息」页的文字不动，已打包的 zip 保留）"""
     try:
         ecom.clear_all()
         n = ecom.MAX_PRODUCT_REFS
-        return ("🧹 已清空主图/详情页的策划、底图、成品和顶部产品实拍图（已打包的 zip 保留在 exports/；"
+        return ("🧹 已清空主图/详情页的策划、底图、成品和产品实拍图（已打包的 zip 保留在 exports/；"
                 "已生成的视频剧本自带一份产品图，不受影响）。"
-                "\n请在顶部改成新产品的信息，上传新产品图后重新策划。"), {}, None, ecom_product_note(), \
+                "\n请在「📦 产品信息」页改成新产品的信息，上传新产品图后重新策划。"), {}, None, ecom_product_note(), \
             *([None] * n), *([""] * n)
     except Exception as e:
         return (err(e), gr.skip(), gr.skip(), gr.skip(), *([gr.skip()] * (ecom.MAX_PRODUCT_REFS * 2)))
 
 
-def render_ecom_card(kind: str, it: dict):
+def render_ecom_card(kind: str, it: dict, playbook: str | None = None):
     """在 @gr.render 上下文中绘制单张主图/详情页卡片"""
     is_main = kind == "main"
-    issues = ecom.item_issues(it)
+    issues = ecom.item_issues(it, playbook)
     final = it.get("final_path") if _ready(it.get("final_path")) else None
-    with gr.Group(), gr.Row():
+    with gr.Group(elem_classes="asset-card"), gr.Row():
         with gr.Column(scale=1, min_width=200):
             gr.Image(value=final, label=f"{it['id']} 成品" if final else f"{it['id']}（未生成）",
-                     interactive=False, height=300)
+                     interactive=False, height=320)
         with gr.Column(scale=2):
-            people = "、".join(it.get("use_characters") or []) or "无"
-            mode = ""
+            people = "、".join(it.get("use_characters") or [])
+            chips = [ui.chip("已生成", "ok") if final else ui.chip("待生成")]
             if final and ecom.has_text(it):
-                mode = " · " + ("AI 写字，请逐字核对" if it.get("base_mode") == "ai" else "程序叠字")
-            gr.Markdown(f"**{it['id']} · {it['role']}** · 出镜角色：{people}{mode}"
-                        + (f"\n\n⚠️ {'、'.join(issues)}" if issues else ""))
+                if it.get("base_mode") == "ai":
+                    chips.append(ui.chip("AI 写字 · 请逐字核对", "warn"))
+                else:
+                    chips.append(ui.chip("程序叠字" + ("（简版排版）" if it.get("renderer") == "pil" else ""), "accent"))
             if it.get("white_bg"):
-                gr.Markdown("白底图不加文字。")
+                chips.append(ui.chip("白底图 · 不加文字"))
+            if people:
+                chips.append(ui.chip(f"出镜：{people}"))
+            layout = it.get("layout_warnings") or []
+            fidelity = ecom.fidelity_note(it)
+            warnings = ([f"⚠️ {'、'.join(issues)}"] if issues else []) + \
+                       ([f"📐 排版提示：{'；'.join(layout)}"] if layout else []) + \
+                       ([fidelity] if fidelity else [])
+            gr.HTML(ui.card_head(it["id"], it["role"], chips, warnings))
+            if it.get("white_bg"):
                 head = gr.Textbox(value="", visible=False)
                 sub = gr.Textbox(value="", visible=False)
                 badges = gr.Textbox(value="", visible=False)
+                tag = gr.Textbox(value="", visible=False)
+                price_label = gr.Textbox(value="", visible=False)
+                price = gr.Textbox(value="", visible=False)
+                specs = gr.Textbox(value="", visible=False)
+                layout = gr.Textbox(value="standard", visible=False)
+                compare = gr.Textbox(value="", visible=False)
             else:
+                # gr.render 里新建的组件必须显式 interactive=True：否则前端会把「有默认值」的框当成只读展示
+                # （策划后主标题/副标题/卖点有值就改不了，留空的角标/价格反而能改）
                 head = gr.Textbox(label="主标题" if is_main else "标题",
-                                  value=it.get("headline" if is_main else "title", ""))
-                sub = gr.Textbox(label="副标题" if is_main else "正文",
+                                  value=it.get("headline" if is_main else "title", ""), interactive=True)
+                sub = gr.Textbox(label="副标题" if is_main else "正文", interactive=True,
                                  value=it.get("subline" if is_main else "body", ""), lines=1 if is_main else 2)
-                badges = gr.Textbox(label="角标（每行一个，最多 3 个）" if is_main else "要点（每行一条，最多 4 条）",
+                badges = gr.Textbox(label="卖点标签（每行一个，最多 3 个）" if is_main
+                                    else "要点（每行一条，最多 4 条；步骤用 ①②③ 开头）", interactive=True,
                                     value="\n".join(it.get("badges" if is_main else "bullets", [])), lines=2)
+                with gr.Row():
+                    tag = gr.Textbox(label="左上角角标（选填）" if is_main else "标题上方小标签（选填）",
+                                     value=it.get("tag", ""), max_lines=1, interactive=True)
+                    price_label = gr.Textbox(label="价格说明（如 券后价）", value=it.get("price_label", ""),
+                                             max_lines=1, visible=is_main, interactive=True)
+                    price = gr.Textbox(label="价格（数字，不带 ¥；留空则不显示）", value=it.get("price", ""),
+                                       max_lines=1, visible=is_main, interactive=True)
+                specs = gr.Textbox(label="参数表（选填，每行「名称：值」，最多 6 行）", interactive=True,
+                                   value=ecom.specs_text(it.get("specs")), lines=3, visible=not is_main)
+                with gr.Row(visible=not is_main):
+                    layout = gr.Dropdown(label="版式（信息图由程序排版，文字准确）", choices=ecom.layout_choices(),
+                                         value=it.get("layout") or "standard", interactive=True)
+                    compare = gr.Textbox(label="对比表（版式选对比表时用）", interactive=True, lines=3,
+                                         value=ecom.compare_text(it.get("compare")),
+                                         placeholder="普通做法｜本品\n冲泡｜要洗茶｜开水直接冲\n口感｜偏苦涩｜回味甘甜")
             with gr.Accordion("画面描述（英文，改后点重新生成画面）", open=False):
-                scene = gr.Textbox(value=it.get("scene_prompt_en", ""), lines=4, show_label=False)
+                scene = gr.Textbox(value=it.get("scene_prompt_en", ""), lines=4, show_label=False,
+                                   interactive=True)
             with gr.Row():
-                btn_text = gr.Button("💾 保存文字并重排", size="sm")
+                btn_text = gr.Button("💾 保存文字并重排", size="sm", variant="primary")
                 btn_regen = gr.Button("🔄 重新生成画面", size="sm")
     iid = it["id"]
     # 写字方式取页面上的全局选项，「重新生成画面」按当前选择出图
-    fields = [head, sub, badges, scene, ecom_text_mode]
+    fields = [head, sub, badges, scene, ecom_text_mode, tag, price_label, price, specs, layout, compare]
     # kind / iid 用默认参数绑定，避免闭包在循环中取到最后一个值
     btn_text.click(fn=lambda *v, k=kind, i=iid: ecom_save_item(k, i, False, *v),
                    inputs=fields, outputs=[status_text, ecom_state], concurrency_id="pipeline", concurrency_limit=1)
@@ -941,13 +1168,14 @@ def render_shot_card(sb, shot, char_names, scene_names):
     has_h3 = prompt_file_for(shot).exists()
     who = "、".join(char_names.get(c, c) for c in shot.get("characters", [])) or "无人物"
     where = scene_names.get(shot.get("scene"), "—")
-    with gr.Group():
+    with gr.Group(elem_classes="asset-card"):
         with gr.Row():
             with gr.Column(scale=1):
-                gr.Markdown(
-                    f"#### 🎬 镜头 {shot.get('id')} ({shot.get('duration_sec')}s) | 模式: `{shot.get('mode')}` | 节拍: `{shot.get('emotion_beat')}`"
-                    f"\n\n👤 {who} · 🏠 {where}"
-                )
+                chips = [ui.chip(f"{shot.get('duration_sec')}s"), ui.chip(shot.get("mode") or "—", "accent"),
+                         ui.chip(f"节拍：{shot.get('emotion_beat') or '—'}"),
+                         ui.chip(f"👤 {who}"), ui.chip(f"🏠 {where}"),
+                         ui.chip("H3 提示词已就绪", "ok") if has_h3 else ui.chip("H3 提示词未生成", "warn")]
+                gr.HTML(ui.card_head(f"S{shot_id(shot):02d}", f"镜头 {shot.get('id')}", chips))
                 gr.Textbox(label="🗣️ 口播台词", value=shot.get("voiceover", ""), interactive=False)
                 gr.Textbox(label="🎥 视觉构图描述", value=shot.get("visual_intent", ""), lines=2, interactive=False)
                 gr.Textbox(
@@ -994,19 +1222,31 @@ def render_shot_card(sb, shot, char_names, scene_names):
 
 
 with gr.Blocks(title="AI 带货内容全链路流水线", **BLOCKS_KW) as demo:
-    gr.Markdown("# 🎬 AI 带货内容全链路流水线")
+    gr.HTML(ui.header_html("AI 带货内容全链路流水线", "一份产品信息，生成带货视频、主图和详情页",
+                           ["产品信息", "带货视频", "主图 / 详情页"]))
 
     # 保存完整 storyboard（shots + product_refs + meta），刷新页面时从磁盘恢复
     sb_state = gr.State(load_storyboard)
-
-    # ── 顶部：产品信息 + 卖点分析（视频和图文共用）+ 系统状态 ────────────────────
     _brief = brief_mod.load_brief()
-    with gr.Row():
-        with gr.Column(scale=3):
-            with gr.Accordion("📦 产品信息与卖点（视频脚本和主图/详情页共用）", open=True):
-                with gr.Row():
-                    with gr.Column(scale=1, min_width=300):
-                        gr.Markdown("**① 填写产品信息**（越具体，卖点分析越准）")
+
+    # ── 运行日志：所有步骤共用，固定在右侧栏，切页、滚动时都看得到 ─────────────────
+    _log_kw = dict(label="运行日志", show_label=False, interactive=False, autoscroll=True, elem_classes="console",
+                   placeholder="点任意步骤按钮后，进度和结果显示在这里")
+    if HAS_RIGHT_SIDEBAR:
+        with gr.Sidebar(position="right", open=True, width=380, elem_classes="console-sidebar"):
+            gr.HTML(ui.console_head_html())
+            status_text = gr.Textbox(lines=26, max_lines=26, **_log_kw)
+    else:
+        with gr.Accordion("运行日志", open=True):
+            status_text = gr.Textbox(lines=8, max_lines=8, **_log_kw)
+
+    with gr.Tabs(elem_classes="nav-tabs"):
+        # ════════════════════════════ 产品信息（视频和图文共用） ════════════════════════════
+        with gr.Tab("📦 产品信息"):
+            with gr.Row(equal_height=False):
+                with gr.Column(scale=1, min_width=320):
+                    with gr.Accordion("① 填写产品信息", open=True):
+                        gr.Markdown("越具体，卖点分析越准。带货视频和主图/详情页共用这里的信息。", elem_classes="hint")
                         with gr.Row():
                             prod_name = gr.Textbox(label="商品名称", value=_brief["name"], scale=3)
                             prod_color = gr.ColorPicker(label="品牌主色", value=_brief["brand_color"],
@@ -1022,19 +1262,48 @@ with gr.Blocks(title="AI 带货内容全链路流水线", **BLOCKS_KW) as demo:
                             label="真实背书（选填，只有这里写的才会出现在文案中）", value=_brief["endorsements"],
                             lines=2, placeholder="证书、专利、检测报告编号、真实销量……没有就留空",
                         )
+                        prod_reviews = gr.Textbox(
+                            label="买家评价 / 问大家 / 竞品卖点（选填，粘贴原文）", value=_brief["reviews"], lines=3,
+                            placeholder="真实的买家原话最能说明痛点和用语。只用来提炼痛点，不会被当作评价写进文案",
+                        )
+                        with gr.Row():
+                            prod_playbook = gr.Dropdown(
+                                choices=cp.choices(), scale=2,
+                                # 保存的自定义手册被删掉时退回自动识别，否则下拉框的值不在选项里
+                                value=_brief["playbook"] if _brief["playbook"] in [v for _, v in cp.choices()] else cp.AUTO,
+                                label="类目手册（决定卖点角度、详情页屏序、类目合规词）",
+                            )
+                            prod_playbook_md = gr.Markdown(playbook_info(_brief), elem_classes="hint")
+                        with gr.Accordion("➕ 新建 / 编辑自定义类目手册（内置手册里没有你的类目时用）", open=False):
+                            gr.Markdown(
+                                "点「AI 起草」按上面的商品信息生成一份手册草稿，核对、修改后保存。"
+                                "`parent` 是最接近的内置类目，它的合规风险词会被继承、不能删减；"
+                                "`compliance` 里写这个类目额外要查的风险词。保存在 `pipeline/playbooks/`。"
+                                "风险词只是初筛，食品、保健、宠物饲料等类目上线前请找法务或类目专家确认。",
+                                elem_classes="hint",
+                            )
+                            playbook_editor = gr.Code(language="json", label="手册内容（JSON）", lines=14,
+                                                      interactive=True)
+                            with gr.Row():
+                                btn_draft_pb = gr.Button("🤖 AI 起草", size="sm")
+                                btn_save_pb = gr.Button("💾 保存并选用", size="sm", variant="primary")
+                                btn_del_pb = gr.Button("🗑️ 删除当前选中的自定义手册", size="sm")
+                        btn_check = gr.Button("🩺 输入体检（检查还缺哪些信息）", size="sm")
                         btn_analyze = gr.Button("🔍 分析卖点（再点一次即重新分析）", variant="primary")
-                    with gr.Column(scale=1, min_width=300):
-                        gr.Markdown("**② 卖点分析**（LLM 生成，可直接修改；后续剧本和图文都以这里为准）")
+                with gr.Column(scale=1, min_width=320):
+                    with gr.Accordion("② 卖点分析", open=True):
+                        gr.Markdown("LLM 生成，可直接修改；后续剧本和图文都以这里为准。", elem_classes="hint")
                         prod_usp = gr.Textbox(label="核心卖点（每行一个，按说服力排序）", value=_brief["usp"], lines=4)
                         prod_pain = gr.Textbox(label="用户痛点（每行一个）", value=_brief["pain_points"], lines=2)
                         prod_diff = gr.Textbox(label="差异化", value=_brief["differentiation"], lines=1)
                         prod_persona = gr.Textbox(label="目标人群画像", value=_brief["persona"], lines=1)
                         prod_scenes = gr.Textbox(label="使用场景（每行一个）", value=_brief["scenes"], lines=2)
 
-            with gr.Accordion("📸 产品实拍图（视频剧本和主图/详情页共用）", open=True):
+            with gr.Accordion("③ 产品实拍图", open=True):
                 gr.Markdown(f"最多 {ecom.MAX_PRODUCT_REFS} 张不同角度（如正面 / 侧面 / 细节），包装文字清晰可辨。"
                             "AI 以这些图为参考生成剧本需要的产品镜头图和主图/详情页，保证与实物一致。"
-                            "图下可写角度说明（帮助 AI 理解每张图）。点图片右上角 ✕ 删除，拖入新图即替换。")
+                            "图下可写角度说明（帮助 AI 理解每张图）。点图片右上角 ✕ 删除，拖入新图即替换。",
+                            elem_classes="hint")
                 ecom_slots, ecom_labels = [], []
                 with gr.Row():
                     for slot in range(1, ecom.MAX_PRODUCT_REFS + 1):
@@ -1043,46 +1312,61 @@ with gr.Blocks(title="AI 带货内容全链路流水线", **BLOCKS_KW) as demo:
                             ecom_slots.append(gr.Image(
                                 value=(lambda s=slot: ecom.product_slot_path(s)),
                                 label=f"产品图 {slot}" + ("（主）" if slot == 1 else ""),
-                                type="filepath", sources=["upload"], height=220,
+                                type="filepath", sources=["upload"], height=240,
                             ))
                             ecom_labels.append(gr.Textbox(
                                 value=(lambda s=slot: ecom.product_label(s)), show_label=False,
                                 placeholder=["正面平视，白底", "侧面 45°", "细节特写 / 使用中"][slot - 1]
                                 if slot <= 3 else "角度 / 内容说明",
                             ))
-                ecom_product_md = gr.Markdown(ecom_product_note)
-        with gr.Column(scale=2):
-            status_text = gr.Textbox(label="系统状态", interactive=False, lines=12, max_lines=12, autoscroll=True)
+                ecom_product_md = gr.Markdown(ecom_product_note, elem_classes="hint")
+            gr.Markdown("填好后切到上方「🎬 带货视频」或「🖼️ 主图 / 详情页」继续。每一步的进度和结果都显示在右侧运行日志。",
+                        elem_classes="tip-card")
 
-    # 顺序必须与 BRIEF_FIELDS 一致（INPUT_FIELDS + ANALYSIS_FIELDS）
-    brief_inputs = [prod_name, prod_category, prod_desc, prod_audience, prod_price, prod_endorse, prod_color,
-                    prod_usp, prod_pain, prod_diff, prod_persona, prod_scenes]
-    analysis_outputs = [prod_usp, prod_pain, prod_diff, prod_persona, prod_scenes]
+        # 顺序必须与 BRIEF_FIELDS 一致（INPUT_FIELDS + ANALYSIS_FIELDS）
+        brief_inputs = [prod_name, prod_category, prod_desc, prod_audience, prod_price, prod_endorse, prod_color,
+                        prod_reviews, prod_playbook,
+                        prod_usp, prod_pain, prod_diff, prod_persona, prod_scenes]
+        analysis_outputs = [prod_usp, prod_pain, prod_diff, prod_persona, prod_scenes]
 
-    with gr.Tabs():
         # ════════════════════════════ 带货视频 ════════════════════════════
         with gr.Tab("🎬 带货视频"), gr.Row():
             with gr.Column(scale=2, min_width=340):
                 with gr.Accordion("① 剧本策划", open=True):
                     story_template = gr.Dropdown(
-                        choices=list(STORY_TEMPLATES), value=DEFAULT_TEMPLATE,
-                        label="剧本模板 (决定镜头数量和每个镜头的叙事任务)",
+                        choices=template_choices(), value=DEFAULT_TEMPLATE,
+                        label="视频类型 · 剧本模板 (决定编导角色、镜头数量和每个镜头的叙事任务)",
                     )
                     template_desc = gr.Markdown(template_info(DEFAULT_TEMPLATE))
+                    custom_beats = gr.Textbox(
+                        label="自定义节拍", lines=4, visible=False,
+                        placeholder="开场钩子 | A-Roll | 主播举着茶杯问：这层白霜是什么？\n"
+                                    "卖点展示 | B-Roll | 莓茶叶片上白霜的微距特写\n"
+                                    "使用场景 | A-Roll | 办公室里冲泡、喝第一口的表情\n"
+                                    "行动召唤 | A-Roll | 主播说出适合谁喝",
+                    )
 
                     platform = gr.Dropdown(
                         choices=list(PLATFORMS), value=DEFAULT_PLATFORM,
-                        label="目标平台 (决定画幅和剧本节奏)",
+                        label="目标平台 (决定画幅、单镜时长、口播字数和推荐模板)",
                     )
-                    platform_desc = gr.Markdown(platform_info(DEFAULT_PLATFORM))
+                    platform_desc = gr.Markdown(platform_info(DEFAULT_PLATFORM, DEFAULT_TEMPLATE))
 
                     agent_skill = gr.Dropdown(
-                        choices=skill_choices, value=[], multiselect=True,
-                        label="编剧技能 (可多选，留空则不注入)",
+                        choices=skill_choices, value=default_skills, multiselect=True,
+                        label="编剧技能 (默认选中项目自带的短视频带货技能；长剧/舞台技能会稀释重点，按需添加)",
                     )
                     include_skill_refs = gr.Checkbox(
                         label=f"同时注入技能参考资料 reference*.md (更贴合技法，但更耗 token，上限 {SKILL_CHAR_BUDGET} 字符)",
                         value=False,
+                    )
+                    video_review = gr.Checkbox(
+                        label="生成后让模型按评分标准自检并修改一轮（多一次 LLM 调用，约多一倍耗时和 token）",
+                        value=False,
+                    )
+                    video_concept = gr.Checkbox(
+                        label="先出 3 个创意方向，选最好的一个再写分镜（多一次 LLM 调用；钩子和冲突更有想法）",
+                        value=True,
                     )
                     btn_layer1 = gr.Button("1️⃣ 生成分镜脚本", variant="primary")
 
@@ -1091,22 +1375,24 @@ with gr.Blocks(title="AI 带货内容全链路流水线", **BLOCKS_KW) as demo:
                     def render_ref_uploads(sb):
                         refs = (sb or {}).get("product_refs", [])
                         if not (sb or {}).get("shots"):
-                            gr.Markdown("*生成分镜后，这里会列出剧本需要的真实产品图和拍摄要求。*")
+                            gr.Markdown("生成分镜后，这里会列出剧本需要的真实产品图和拍摄要求。", elem_classes="hint")
                             return
                         if not refs:
-                            gr.Markdown("💡 本剧本没有真实产品入画的镜头，无需上传产品图。")
+                            gr.Markdown("💡 本剧本没有真实产品入画的镜头，无需上传产品图。", elem_classes="hint")
                             return
 
-                        gr.Markdown("**📸 剧本需要的产品镜头图**：以顶部实拍图为参考由 AI 生成，"
-                                    "执行 2️⃣ 时自动补齐；不满意点「重新生成」。")
+                        gr.Markdown("**📸 剧本需要的产品镜头图**：以「📦 产品信息」页的实拍图为参考由 AI 生成，"
+                                    "执行 2️⃣ 时自动补齐；不满意点「重新生成」。", elem_classes="hint")
                         for ref in refs:
                             rid = ref["id"]
                             used = "、".join(f"镜头 {s}" for s in ref.get("used_in", []))
                             path = ref.get("image_path", "")
                             done = bool(path and os.path.exists(path))
-                            with gr.Group():
-                                gr.Markdown(f"**{'✅' if done else '⬜'} {rid}** · 用于 {used}\n\n{ref.get('desc', '')}")
-                                # 只展示，不在这里上传；产品实拍图统一在页面顶部上传
+                            with gr.Group(elem_classes="asset-card"):
+                                gr.HTML(ui.card_head(rid, f"用于 {used}" if used else "产品镜头图",
+                                                     [ui.chip("已生成", "ok") if done else ui.chip("待生成")],
+                                                     notes=[ref.get("desc", "")]))
+                                # 只展示，不在这里上传；产品实拍图统一在「📦 产品信息」页上传
                                 gr.Image(value=path if done else None, interactive=False, height=180,
                                          label=rid if done else f"{rid}（待生成）")
                                 btn_gen = gr.Button("🔄 重新生成" if done else "🤖 现在生成", size="sm")
@@ -1115,19 +1401,20 @@ with gr.Blocks(title="AI 带货内容全链路流水线", **BLOCKS_KW) as demo:
                                           outputs=[status_text, sb_state],
                                           concurrency_id="pipeline", concurrency_limit=1)
 
-                    gr.Markdown("👤 角色定妆照在右侧「剧本」页查看、重新生成或上传替换。")
+                    gr.Markdown("👤 角色定妆照在右边「📜 剧本」页查看、重新生成或上传替换。", elem_classes="hint")
                     is_draft = gr.Checkbox(label="草图模式 (nano-banana-2-lite，又快又便宜，固定 1:1)", value=False)
                     btn_layer2 = gr.Button("2️⃣ 生成定妆照 + 基底图 (完成后自动生成 H3 提示词)", variant="primary")
 
                 with gr.Accordion("③ 渲染与合成", open=True):
                     gr.Markdown(
                         "**模式 B · Diffusers 全自动**：一键在云端渲染并拼接成片。"
-                        "默认只渲染还没有视频的镜头（每镜约 6 分钟 GPU），失败后再点一次只补失败的。"
+                        "默认只渲染还没有视频的镜头（每镜约 6 分钟 GPU），失败后再点一次只补失败的。",
+                        elem_classes="hint",
                     )
                     force_all = gr.Checkbox(label="全部重新渲染（忽略已有镜头视频）", value=False)
                     btn_batch_run = gr.Button("🚀 批量渲染并自动拼接", variant="primary")
-                    gr.Markdown("**模式 A · ComfyUI 手动**：在右侧「分镜脚本」页逐镜复制提示词；渲染好的视频放进 "
-                                "`pipeline/output/videos/` 后点下方拼接。")
+                    gr.Markdown("**模式 A · ComfyUI 手动**：在右边「🎞️ 分镜脚本」页逐镜复制提示词；渲染好的视频放进 "
+                                "`pipeline/output/videos/` 后点下方拼接。", elem_classes="hint")
                     btn_layer4 = gr.Button("4️⃣ 拼接本地已有的镜头视频 (FFmpeg)", variant="secondary")
 
             with gr.Column(scale=3), gr.Tabs():
@@ -1136,10 +1423,11 @@ with gr.Blocks(title="AI 带货内容全链路流水线", **BLOCKS_KW) as demo:
                     def render_script(sb):
                         script = (sb or {}).get("script") or {}
                         if not (sb or {}).get("shots"):
-                            gr.Markdown("*生成分镜后，这里显示完整剧本、角色和场景设定。*")
+                            gr.Markdown("在左侧点「1️⃣ 生成分镜脚本」\n\n生成后这里显示完整剧本、角色定妆照和场景设定。",
+                                        elem_classes="empty-state")
                             return
                         if not script.get("full_text") and not script.get("characters"):
-                            gr.Markdown("⚠️ 当前分镜是旧版本生成的，没有剧本数据，请重新生成分镜。")
+                            gr.Markdown("⚠️ 当前分镜是旧版本生成的，没有剧本数据，请重新生成分镜。", elem_classes="tip-card")
                             return
 
                         gr.Markdown(f"## {script.get('title') or '未命名'}\n\n{script.get('logline', '')}")
@@ -1148,8 +1436,8 @@ with gr.Blocks(title="AI 带货内容全链路流水线", **BLOCKS_KW) as demo:
 
                         if script.get("characters"):
                             gr.Markdown(
-                                "### 👤 角色定妆照 (所有镜头共用，保证人物一致)\n"
-                                "定妆照会作为 Ref2VA 参考图传给 H3。层 2 按英文外貌自动生成；"
+                                "### 👤 角色定妆照\n"
+                                "所有镜头共用，保证人物一致。定妆照会作为 Ref2VA 参考图传给 H3，层 2 按英文外貌自动生成；"
                                 "不满意可重新生成，或上传真人模特照替换。"
                             )
                             source_label = {"generated": "AI 生成", "draft": "草图", "upload": "上传"}
@@ -1158,19 +1446,20 @@ with gr.Blocks(title="AI 带货内容全链路流水线", **BLOCKS_KW) as demo:
                                 path = c.get("image_path", "")
                                 done = _ready(path)
                                 used = "、".join(f"镜头 {s}" for s in shots_with_character(sb, cid)) or "无"
-                                with gr.Group(), gr.Row():
+                                with gr.Group(elem_classes="asset-card"), gr.Row():
                                     with gr.Column(scale=1, min_width=160):
-                                        img = gr.Image(
+                                        img = gr.Image(  # interactive=True：已有定妆照时也要能拖图替换
                                             value=path if done else None, type="filepath", sources=["upload"],
+                                            interactive=True,
                                             label=f"{cid} 定妆照" + (f"（{source_label.get(c.get('image_source'), '')}）" if done else "（层 2 生成）"),
                                             height=260,
                                         )
                                         regen = gr.Button("🔄 重新生成定妆照", size="sm")
                                     with gr.Column(scale=2):
-                                        gr.Markdown(
-                                            f"**{'✅' if done else '⬜'} {cid} · {c.get('name', '')}**（{c.get('role', '')}）· 出场：{used}"
-                                            f"\n\n{c.get('appearance_zh', '')}"
-                                        )
+                                        chips = [ui.chip("定妆照已就绪", "ok") if done else ui.chip("待生成"),
+                                                 ui.chip(c.get("role") or "角色", "accent"), ui.chip(f"出场：{used}")]
+                                        gr.HTML(ui.card_head(cid, c.get("name", ""), chips,
+                                                             notes=[c.get("appearance_zh", "")]))
                                         gr.Textbox(label="英文外貌锚点 (生成定妆照 + 原样写进每条 H3 提示词)",
                                                    value=c.get("appearance_en", ""), lines=3,
                                                    interactive=False, **COPY_BTN)
@@ -1192,7 +1481,8 @@ with gr.Blocks(title="AI 带货内容全链路流水线", **BLOCKS_KW) as demo:
                     def render_shot_cards(sb):
                         shots = (sb or {}).get("shots", [])
                         if not shots:
-                            gr.Markdown("*请先点击左侧「生成分镜脚本」，生成后将在此处自动装配各个镜头的资产卡片。*")
+                            gr.Markdown("在左侧点「1️⃣ 生成分镜脚本」\n\n生成后这里会逐镜列出口播、构图、H3 提示词和参考图。",
+                                        elem_classes="empty-state")
                             return
 
                         script = (sb or {}).get("script") or {}
@@ -1225,33 +1515,38 @@ with gr.Blocks(title="AI 带货内容全链路流水线", **BLOCKS_KW) as demo:
                                                    label="主图张数")
                         ecom_main_ratio = gr.Radio(choices=list(ecom.MAIN_RATIOS), value=ecom.MAIN_RATIOS[0],
                                                    label="主图比例")
-                    gr.Markdown("主图 1:1 = 1440×1440，3:4 = 1440×1920；详情页固定 15 张 3:4。")
+                    gr.Markdown("主图 1:1 = 1440×1440，3:4 = 1440×1920；详情页固定 15 张 3:4。", elem_classes="hint")
                     ecom_use_chars = gr.Checkbox(label="允许定妆照里的模特出镜（与视频同一人）", value=True)
+                    gr.Markdown("📸 产品实拍图在「📦 产品信息」页上传（与带货视频共用）。", elem_classes="hint")
 
-                gr.Markdown("📸 产品实拍图在页面顶部上传（与带货视频共用）。")
-
-                with gr.Accordion("③ 策划与生成", open=True):
+                with gr.Accordion("② 策划与生成", open=True):
+                    ecom_review = gr.Checkbox(
+                        label="策划后让模型按评分标准自检并修改一轮（多一次 LLM 调用）", value=False)
                     btn_ecom_plan = gr.Button("① 策划图文 (LLM 出每张图的文案和画面)", variant="primary")
                     ecom_text_mode = gr.Radio(
                         choices=[(label, key) for key, label in ecom.TEXT_MODES.items()],
                         value=ecom.DEFAULT_TEXT_MODE, label="文字上图方式",
-                        info="程序叠字：中文不会错，改字只重排不花钱，版式较模板化。"
+                        info="程序叠字：中文不会错，改字只重排不花钱，由 HTML 模板排版（角标、价格标签、参数表）。"
                              "AI 直接写字：设计感更强，但可能错字/漏字，改字要重新生成画面。"
                              "切换后点生成，有文字的图会按新方式重新生成。",
                     )
                     ecom_force = gr.Checkbox(label="全部重新生成画面（默认只生成还没有底图的）", value=False)
+                    ecom_fidelity = gr.Checkbox(
+                        label="生成后让视觉模型核对主图里的产品（包装文字 / logo / 配色是否与实拍图一致，每张多一次调用）",
+                        value=False)
                     btn_ecom_gen = gr.Button("② 生成全部图片", variant="primary")
 
-                with gr.Accordion("④ 导出", open=True):
+                with gr.Accordion("③ 导出", open=True):
                     btn_ecom_export = gr.Button("📦 打包下载全部成品", variant="secondary")
-                    ecom_zip = gr.File(label="下载", interactive=False)
+                    ecom_zip = gr.File(label="下载", interactive=False, height=96)
                     btn_ecom_clear = gr.Button("🧹 清空，开始新产品", variant="stop", size="sm")
                     gr.Markdown("清空本页策划、底图、成品和产品图；已打包的 zip 保留在 "
-                                "`pipeline/output/ecom/exports/`。顶部产品信息不清，请手动改。")
+                                "`pipeline/output/ecom/exports/`。「📦 产品信息」页的文字不清，请手动改。",
+                                elem_classes="hint")
 
                 gr.Markdown(
                     "💡 主图拉点击率（一图一卖点），详情页拉转化率（痛点 → 卖点 → 证据 → 场景 → 细节 → 规格售后）。"
-                    "文案中的【占位】需替换为真实信息；上架前请核对包装文字和 logo。"
+                    "文案中的【占位】需替换为真实信息；上架前请核对包装文字和 logo。", elem_classes="tip-card"
                 )
 
             with gr.Column(scale=3):
@@ -1261,7 +1556,8 @@ with gr.Blocks(title="AI 带货内容全链路流水线", **BLOCKS_KW) as demo:
                 def render_ecom(plan):
                     plan = plan or {}
                     if not plan.get("main_images"):
-                        gr.Markdown("*在左侧设置规格并点「策划图文」，这里会列出每张主图和详情页的文案，可逐张修改。*")
+                        gr.Markdown("在左侧设置规格并点「① 策划图文」\n\n这里会列出每张主图和详情页的文案，可逐张修改后再生成。",
+                                    elem_classes="empty-state")
                         return
                     meta = plan.get("meta", {})
                     ratio = meta.get("main_ratio", "1:1")
@@ -1269,24 +1565,45 @@ with gr.Blocks(title="AI 带货内容全链路流水线", **BLOCKS_KW) as demo:
                     dw, dh = ecom.TARGET_SIZES[ecom.DETAIL_RATIO]
                     with gr.Tabs():
                         with gr.Tab(f"主图 {len(plan['main_images'])} 张 · {ratio}（{mw}×{mh}）"):
-                            gr.Markdown(f"{meta.get('platform', '')} · 首图决定点击率")
+                            gr.Markdown(f"{meta.get('platform', '')} · 首图决定点击率", elem_classes="hint")
                             for it in plan["main_images"]:
-                                render_ecom_card("main", it)
+                                render_ecom_card("main", it, meta.get("playbook"))
                         with gr.Tab(f"详情页 {len(plan['detail_sections'])} 张 · 3:4（{dw}×{dh}）"):
-                            gr.Markdown("按序号逐张上传")
+                            gr.Markdown("按序号逐张上传", elem_classes="hint")
                             for it in plan["detail_sections"]:
-                                render_ecom_card("detail", it)
+                                render_ecom_card("detail", it, meta.get("playbook"))
 
     story_template.change(fn=template_info, inputs=[story_template], outputs=[template_desc])
-    platform.change(fn=platform_info, inputs=[platform], outputs=[platform_desc])
+    story_template.change(fn=lambda t: gr.update(visible=t == CUSTOM_TEMPLATE), inputs=[story_template],
+                          outputs=[custom_beats])
+    # 平台和模板互相影响：换平台时把模板切到推荐模板；手动换成不适合的模板时提示
+    platform.change(fn=on_platform_change, inputs=[platform, story_template],
+                    outputs=[platform_desc, story_template])
+    story_template.change(fn=platform_info, inputs=[platform, story_template], outputs=[platform_desc])
+    for box in (prod_category, prod_name, prod_desc):
+        box.blur(fn=lambda *v: playbook_info(collect_brief(v, save=False)), inputs=brief_inputs,
+                 outputs=[prod_playbook_md])
+    prod_playbook.change(fn=lambda *v: playbook_info(collect_brief(v, save=False)), inputs=brief_inputs,
+                         outputs=[prod_playbook_md])
+    # 自定义类目手册：选中自定义手册时把内容填进编辑框
+    prod_playbook.change(fn=lambda k: cp.custom_to_text(k) if cp.is_custom(k) else gr.skip(),
+                         inputs=[prod_playbook], outputs=[playbook_editor])
 
     # 所有步骤都读写同一份 storyboard / 输出目录，共用一个并发队列串行执行，避免互相覆盖
     queue_kw = dict(concurrency_id="pipeline", concurrency_limit=1)
 
+    btn_check.click(fn=run_brief_check, inputs=brief_inputs, outputs=[status_text])
+    btn_draft_pb.click(fn=run_draft_playbook, inputs=brief_inputs, outputs=[status_text, playbook_editor],
+                       **queue_kw)
+    btn_save_pb.click(fn=run_save_playbook, inputs=[playbook_editor], outputs=[status_text, prod_playbook]) \
+        .then(fn=lambda *v: playbook_info(collect_brief(v, save=False)), inputs=brief_inputs,
+              outputs=[prod_playbook_md])
+    btn_del_pb.click(fn=run_delete_playbook, inputs=[prod_playbook], outputs=[status_text, prod_playbook, playbook_editor])
     btn_analyze.click(fn=run_analyze, inputs=brief_inputs, outputs=[status_text] + analysis_outputs, **queue_kw)
     btn_layer1.click(
         fn=run_layer1,
-        inputs=[story_template, platform, agent_skill, include_skill_refs] + brief_inputs,
+        inputs=[story_template, platform, agent_skill, include_skill_refs, video_review, custom_beats,
+                video_concept] + brief_inputs,
         outputs=[status_text, sb_state],
         **queue_kw,
     )
@@ -1304,9 +1621,10 @@ with gr.Blocks(title="AI 带货内容全链路流水线", **BLOCKS_KW) as demo:
     for slot, box in enumerate(ecom_labels, 1):
         box.blur(fn=lambda t, s=slot: ecom.set_product_label(s, t), inputs=[box], outputs=[])
     btn_ecom_plan.click(fn=ecom_plan,
-                        inputs=[ecom_platform, ecom_use_chars, ecom_main_count, ecom_main_ratio] + brief_inputs,
+                        inputs=[ecom_platform, ecom_use_chars, ecom_main_count, ecom_main_ratio, ecom_review]
+                        + brief_inputs,
                         outputs=[status_text, ecom_state], **queue_kw)
-    btn_ecom_gen.click(fn=ecom_generate_all, inputs=[ecom_force, ecom_text_mode],
+    btn_ecom_gen.click(fn=ecom_generate_all, inputs=[ecom_force, ecom_text_mode, ecom_fidelity],
                        outputs=[status_text, ecom_state], **queue_kw)
     btn_ecom_export.click(fn=ecom_export, inputs=[], outputs=[status_text, ecom_zip])
     btn_ecom_clear.click(fn=ecom_clear, inputs=[],

@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{# 主图：一条居中的文字块（主标题 / 副标题 / 价格 + 卖点标签）放在顶部或底部留白区，左上角可选角标 #}
+{% block style %}
+.zone { padding: 5rem 7rem; align-items: center; text-align: center; }
+.has-tag.pos-top .zone { padding-top: 10rem; }   /* 给左上角角标让位 */
+.headline {
+  --size: 8.5rem; font-weight: 800; line-height: 1.22; letter-spacing: .02em;
+  color: var(--head); text-wrap: balance;
+}
+.subline { --size: 4.4rem; line-height: 1.38; color: var(--sub); margin-top: 1.4rem; text-wrap: balance; }
+.chips {
+  display: flex; flex-wrap: wrap; justify-content: center; align-items: center;
+  gap: 1.6rem; margin-top: 2.6rem;
+}
+.badge {
+  font-size: 3.4rem; font-weight: 700; line-height: 1; white-space: nowrap;
+  padding: 1.1rem 2.4rem; border-radius: 999px;
+  background: var(--accent); color: var(--on-accent);
+}
+.price {
+  display: inline-flex; align-items: baseline; gap: .5rem; white-space: nowrap; margin-top: 2.4rem;
+  padding: .9rem 2.8rem 1.2rem; border-radius: 1.8rem;
+  background: var(--accent); color: var(--on-accent);
+  box-shadow: 0 .6rem 1.8rem rgba(0, 0, 0, .18);
+}
+.price + .chips { margin-top: 2rem; }
+.price-label { font-size: 3.2rem; font-weight: 700; margin-right: .6rem; }
+.price-cur { font-size: 4.2rem; font-weight: 800; }
+.price-num { font-size: 7.6rem; font-weight: 900; line-height: 1; font-variant-numeric: tabular-nums; }
+.corner {
+  position: absolute; top: 0; left: 0; white-space: nowrap;
+  padding: 1.4rem 3.2rem 1.6rem; border-bottom-right-radius: 3rem;
+  background: var(--accent); color: var(--on-accent);
+  font-size: 3.8rem; font-weight: 800; line-height: 1; letter-spacing: .06em;
+  box-shadow: 0 .4rem 1.6rem rgba(0, 0, 0, .18);
+}
+{% endblock %}
+
+{% block content %}
+{% if headline %}
+  <h1 class="headline fit shadow" data-max-lines="2" data-label="主标题">{{ headline }}</h1>
+{% endif %}
+{% if subline %}
+  <p class="subline fit shadow" data-max-lines="2" data-label="副标题">{{ subline }}</p>
+{% endif %}
+{% if price %}
+  <div class="price">
+    {% if price_label %}<span class="price-label">{{ price_label }}</span>{% endif %}
+    {% if price[:1].isdigit() %}<span class="price-cur">¥</span>{% endif %}<span class="price-num">{{ price }}</span>
+  </div>
+{% endif %}
+{% if badges %}
+  <div class="chips">
+  {% for b in badges %}
+    <span class="badge">{{ b }}</span>
+  {% endfor %}
+  </div>
+{% endif %}
+{% endblock %}
+
+{% block overlay %}
+{% if tag %}<div class="corner">{{ tag }}</div>{% endif %}
+{% endblock %}

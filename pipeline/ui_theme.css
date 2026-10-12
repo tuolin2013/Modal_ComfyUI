@@ -1,0 +1,172 @@
+/* AI 带货内容工作台 · 界面样式（配合 ui_theme.THEME；颜色尽量走主题变量，浅色 / 深色都能用） */
+
+:root {
+  --ui-grad: linear-gradient(135deg, #6366f1 0%, #8b5cf6 55%, #d946ef 100%);
+  --ui-accent-text: #4f46e5;
+  --ui-accent-bg: rgba(99, 102, 241, .10);
+  --ui-line: #e4e4e7;
+  --ui-line-strong: #d4d4d8;
+  --ui-soft: #f4f4f5;
+  --ui-muted: #71717a;
+  --ui-console: #fafafa;
+  --ui-input-bg: #fafafa;
+  --ui-ok: #15803d;
+  --ui-ok-bg: rgba(22, 163, 74, .10);
+  --ui-warn: #b45309;
+  --ui-warn-bg: rgba(217, 119, 6, .10);
+  --ui-warn-line: rgba(217, 119, 6, .28);
+}
+
+.dark {
+  --ui-accent-text: #a5b4fc;
+  --ui-accent-bg: rgba(99, 102, 241, .16);
+  --ui-line: #1f2126;
+  --ui-line-strong: #33353d;
+  --ui-soft: #131418;
+  --ui-muted: #8a8d98;
+  --ui-console: #07080a;
+  --ui-input-bg: #0a0b0d;
+  --ui-ok: #4ade80;
+  --ui-ok-bg: rgba(74, 222, 128, .10);
+  --ui-warn: #fbbf24;
+  --ui-warn-bg: rgba(251, 191, 36, .09);
+  --ui-warn-line: rgba(251, 191, 36, .22);
+}
+
+/* ── 页头 ─────────────────────────────────────────────────────────────── */
+.app-header {
+  display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px 24px;
+  padding: 4px 2px 20px; margin-bottom: 4px; border-bottom: 1px solid var(--ui-line);
+}
+.app-header .brand { display: flex; align-items: center; gap: 14px; }
+.app-header .logo {
+  width: 42px; height: 42px; flex: none; border-radius: 12px; display: grid; place-items: center;
+  background: var(--ui-grad); color: #fff;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .28), 0 10px 28px -10px rgba(139, 92, 246, .75);
+}
+.app-header .logo svg { width: 22px; height: 22px; }
+.app-header .title { margin: 0; font-size: 21px; font-weight: 650; letter-spacing: -.015em; line-height: 1.25; color: var(--body-text-color); }
+.dark .app-header .title {
+  background: linear-gradient(90deg, #fafafa 0%, #c7d2fe 70%, #d8b4fe 100%);
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.app-header .sub { margin-top: 3px; font-size: 13px; color: var(--ui-muted); }
+.app-header .flow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12.5px; color: var(--ui-muted); }
+.app-header .flow .node {
+  display: inline-flex; align-items: center; gap: 7px; height: 28px; padding: 0 12px;
+  border: 1px solid var(--ui-line); border-radius: 999px; background: var(--ui-soft);
+}
+.app-header .flow .node b { font-family: var(--font-mono); font-size: 11px; font-weight: 600; color: var(--ui-accent-text); }
+.app-header .flow .arrow { width: 16px; height: 1px; background: var(--ui-line-strong); }
+
+/* ── 一级导航：分段控件 ────────────────────────────────────────────────── */
+.nav-tabs > .tab-wrapper { height: auto; padding-bottom: 0; margin: 6px 0 18px; }
+.nav-tabs > .tab-wrapper .tab-container {
+  width: fit-content; height: auto; gap: 4px; padding: 4px; overflow: visible;
+  border: 1px solid var(--ui-line); border-radius: 12px; background: var(--ui-soft);
+}
+.nav-tabs > .tab-wrapper .tab-container::after { display: none; }
+.nav-tabs > .tab-wrapper button[role="tab"] {
+  height: 36px; padding: 0 20px; border-radius: 9px; font-size: 14px; font-weight: 550; color: var(--ui-muted);
+  transition: background-color .15s ease, color .15s ease;
+}
+.nav-tabs > .tab-wrapper button[role="tab"]:hover:not(.selected) { color: var(--body-text-color); background: transparent; }
+.nav-tabs > .tab-wrapper button[role="tab"].selected {
+  color: var(--body-text-color); background: var(--block-background-fill);
+  box-shadow: inset 0 0 0 1px var(--ui-line-strong), 0 1px 3px rgba(0, 0, 0, .18);
+}
+.nav-tabs > .tab-wrapper button[role="tab"].selected::after { display: none; }
+
+
+/* ── 折叠面板：步骤卡片 ────────────────────────────────────────────────── */
+.gr-accordion > .label-wrap { font-size: 14.5px; font-weight: 600; letter-spacing: -.005em; }
+
+/* 说明文字 / 小标题 / 提示卡 */
+.hint .prose, .hint .prose * { font-size: 12.5px !important; line-height: 1.6 !important; color: var(--ui-muted) !important; }
+.hint .prose code { color: var(--body-text-color) !important; }
+.sub-head .prose { font-size: 13px !important; color: var(--ui-muted) !important; }
+.sub-head .prose strong { font-size: 14px; font-weight: 600; color: var(--body-text-color); }
+.tip-card {
+  padding: 12px 14px !important; border-radius: 12px !important;
+  border: 1px solid var(--ui-line) !important; background: var(--ui-soft) !important;
+}
+.tip-card .prose, .tip-card .prose * { font-size: 12.5px !important; line-height: 1.65 !important; color: var(--ui-muted) !important; }
+
+/* 空状态 */
+.empty-state {
+  padding: 56px 24px !important; border: 1px dashed var(--ui-line-strong) !important; border-radius: 16px !important;
+  background: radial-gradient(420px 160px at 50% 0%, var(--ui-accent-bg), transparent 70%) !important;
+  text-align: center;
+}
+.empty-state .prose, .empty-state .prose * { font-size: 14px !important; font-style: normal !important; color: var(--ui-muted) !important; }
+
+/* ── 素材卡片（分镜 / 主图 / 详情页 / 定妆照） ─────────────────────────── */
+.asset-card {
+  margin-bottom: 14px; padding: 14px !important; overflow: hidden;
+  border: 1px solid var(--ui-line) !important; border-radius: 16px !important;
+  background: var(--block-background-fill) !important;
+  transition: border-color .15s ease, box-shadow .15s ease;
+}
+.asset-card:hover { border-color: var(--ui-line-strong) !important; }
+.dark .asset-card:hover { box-shadow: 0 18px 40px -24px rgba(0, 0, 0, .9), 0 0 0 1px rgba(99, 102, 241, .10); }
+/* Group 默认用 1px 间隙拼出分隔线、并把子元素圆角清零；卡片里改成普通间距和圆角按钮 */
+.asset-card > div { gap: 12px !important; background: transparent !important; }
+.asset-card .row { gap: 12px !important; }
+.asset-card button.sm { border-radius: 8px !important; }
+/* Group 也会去掉输入框边框：浅色下白框落在白卡片上看不出来，补回描边和聚焦光圈 */
+.asset-card label textarea, .asset-card label input[type="text"] {
+  background: var(--ui-input-bg) !important; border-radius: 10px !important;
+  box-shadow: inset 0 0 0 1px var(--ui-line) !important;
+  transition: box-shadow .15s ease;
+}
+.asset-card label textarea:hover, .asset-card label input[type="text"]:hover { box-shadow: inset 0 0 0 1px var(--ui-line-strong) !important; }
+.asset-card label textarea:focus, .asset-card label input[type="text"]:focus {
+  box-shadow: inset 0 0 0 1px #6366f1, 0 0 0 3px rgba(99, 102, 241, .18) !important;
+}
+
+.card-head { display: flex; flex-direction: column; gap: 8px; padding: 2px 2px 6px; }
+.card-title { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.card-id {
+  padding: 3px 8px; border-radius: 7px; background: var(--ui-grad); color: #fff;
+  font-family: var(--font-mono); font-size: 12px; font-weight: 600; letter-spacing: .02em;
+}
+.card-name { font-size: 15px; font-weight: 600; color: var(--body-text-color); }
+.card-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip {
+  display: inline-flex; align-items: center; gap: 6px; height: 22px; padding: 0 9px; white-space: nowrap;
+  border: 1px solid var(--ui-line); border-radius: 999px; background: var(--ui-soft);
+  font-size: 12px; font-weight: 500; color: var(--ui-muted);
+}
+.chip-ok, .chip-warn, .chip-accent { border-color: transparent; }
+.chip-ok { color: var(--ui-ok); background: var(--ui-ok-bg); }
+.chip-warn { color: var(--ui-warn); background: var(--ui-warn-bg); }
+.chip-accent { color: var(--ui-accent-text); background: var(--ui-accent-bg); }
+.chip-ok::before, .chip-warn::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.note { padding: 8px 11px; border-radius: 10px; border: 1px solid; font-size: 12.5px; line-height: 1.55; }
+.note-warn { color: var(--ui-warn); background: var(--ui-warn-bg); border-color: var(--ui-warn-line); }
+.note-info { color: var(--ui-muted); background: var(--ui-soft); border-color: var(--ui-line); }
+
+/* ── 右侧运行日志栏 ───────────────────────────────────────────────────── */
+.console-sidebar { border-left: 1px solid var(--ui-line); }
+.dark .console-sidebar { background: #0a0b0d !important; }
+.console-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 2px; }
+.console-head .name { display: flex; align-items: center; gap: 9px; font-size: 13.5px; font-weight: 600; color: var(--body-text-color); }
+.console-head .dot {
+  width: 8px; height: 8px; border-radius: 50%; background: #22c55e;
+  box-shadow: 0 0 0 4px rgba(34, 197, 94, .14); animation: ui-pulse 2.4s ease-in-out infinite;
+}
+.console-head .meta { font-family: var(--font-mono); font-size: 11px; color: var(--ui-muted); }
+.console textarea {
+  font-family: var(--font-mono) !important; font-size: 12.5px !important; line-height: 1.7 !important;
+  background: var(--ui-console) !important;
+}
+@keyframes ui-pulse { 50% { box-shadow: 0 0 0 7px rgba(34, 197, 94, 0); } }
+@media (prefers-reduced-motion: reduce) { .console-head .dot { animation: none; } }
+
+/* ── 杂项 ─────────────────────────────────────────────────────────────── */
+footer { opacity: .5; transition: opacity .2s ease; }
+footer:hover { opacity: 1; }
+.dark ::-webkit-scrollbar { width: 10px; height: 10px; }
+.dark ::-webkit-scrollbar-track { background: transparent; }
+.dark ::-webkit-scrollbar-thumb { background: #26282e; border-radius: 10px; border: 2px solid transparent; background-clip: padding-box; }
+.dark ::-webkit-scrollbar-thumb:hover { background: #34363e; background-clip: padding-box; }
