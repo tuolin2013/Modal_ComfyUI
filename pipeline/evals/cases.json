@@ -41,5 +41,16 @@
       "platform": "抖音/快手（竖版 9:16）",
       "template": "口播种草 · 4镜"
     }
+  ],
+  "_ecom_说明": "主图 / 详情页评测：同一产品在不同渠道的定位不同（拼多多性价比，微信小店高端），检查屏序、价格策略和合规。跑法：python -m evals.run_eval --ecom",
+  "ecom_cases": [
+    {"id": "berry-tea-pdd", "same_brief_as": "berry-tea-shipinhao", "platform": "拼多多", "positioning": "auto",
+     "expect_positioning": "value"},
+    {"id": "berry-tea-wechat", "same_brief_as": "berry-tea-shipinhao", "platform": "微信小店", "positioning": "auto",
+     "expect_positioning": "premium"},
+    {"id": "cat-pdd", "same_brief_as": "cat-douyin", "platform": "拼多多", "positioning": "auto",
+     "expect_positioning": "value"},
+    {"id": "cat-wechat", "same_brief_as": "cat-douyin", "platform": "微信小店", "positioning": "premium",
+     "expect_positioning": "premium"}
   ]
 }

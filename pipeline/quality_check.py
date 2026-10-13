@@ -148,8 +148,9 @@ def format_report(title: str, issues: list[str]) -> str:
 MIN_DESC_CHARS = 30
 
 
-def check_brief(brief: dict, playbook: str) -> list[str]:
-    """生成前的输入体检：信息越全，后面的卖点、剧本和图文越不需要靠模型猜"""
+def check_brief(brief: dict, playbook: str, photo_types: set | None = None, label_text: str = "") -> list[str]:
+    """生成前的输入体检：信息越全，后面的卖点、剧本和图文越不需要靠模型猜。
+    商用标准包另外查包装标签必备项和照片清单（见 check_standard_inputs）"""
     issues = []
     if not str(brief.get("name") or "").strip():
         issues.append(f"{ERR} 没有填写商品名称")
@@ -172,7 +173,39 @@ def check_brief(brief: dict, playbook: str) -> list[str]:
         issues.append(f"{INFO} 没有目标人群，卖点分析会按类目常见人群推断")
     if playbook == cp.GENERAL:
         issues.append(f"{INFO} 没有识别出类目，按通用规则生成；可在「类目手册」里手动选择")
+    return issues + check_standard_inputs(brief, playbook, photo_types, label_text)
+
+
+def check_standard_inputs(brief: dict, playbook: str, photo_types: set | None = None, label_text: str = "") -> list[str]:
+    """
+    商用标准包的输入体检：包装标签必备项缺哪些（按法规列）、建议的照片拍了没有。
+    photo_types：素材库里已有的照片类型（None 表示不检查照片）；label_text：包装背面识别出的标签文字
+    """
+    pb = cp.get(playbook)
+    if not cp.is_standard(playbook):
+        return []
+    issues = []
+    source = " ".join(str(brief.get(k) or "") for k in ("name", "category", "description", "endorsements")) + \
+        " " + (label_text or "")
+    missing = cp.missing_label_items(source, playbook)
+    if missing:
+        issues.append(f"{WARN} 包装标签必备项还缺 {len(missing)} 项（{pb['label_basis']}）："
+                      + "；".join(f"{n}（{t}）" for n, t in missing)
+                      + "。可写进产品描述，或上传包装背面照片自动读取；规格参数屏缺的项会用【占位】")
+    if photo_types is not None:
+        need = [d for t, d, required in pb.get("photo_checklist") or [] if required and t not in photo_types]
+        nice = [d for t, d, required in pb.get("photo_checklist") or [] if not required and t not in photo_types]
+        if need:
+            issues.append(f"{WARN} 建议上传的实拍还缺：{'、'.join(need)}（详情页证据屏会退成 AI 画面）")
+        if nice:
+            issues.append(f"{INFO} 有的话可以补：{'、'.join(nice)}")
     return issues
+
+
+def check_evidence(copy: str, source: str, playbook: str | None, where: str = "文案") -> list[str]:
+    """文案 / 口播里出现、但产品信息里没有依据的说法（有机、野生、含量、等级、天然等），提醒补依据或删掉"""
+    return [f"{WARN} {where}写了「{hit}」，产品信息里没有依据：{tip}"
+            for hit, tip in cp.unsupported_claims(copy, source, playbook)]
 
 
 # ── 剧本 / 分镜 ───────────────────────────────────────────────────────────────

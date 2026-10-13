@@ -5,6 +5,7 @@
   python -m evals.run_eval                 # 全部用例：生成剧本 + 硬校验（每条 1 次 LLM 调用）
   python -m evals.run_eval --judge         # 再加 LLM 按评分标准打分（每条多 1 次调用）
   python -m evals.run_eval --case cat-douyin --self-review
+  python -m evals.run_eval --ecom          # 主图 / 详情页用例：同一产品在拼多多 / 微信小店的定位、屏序和合规
 
 结果写入 evals/results/<时间>.json，终端打印汇总表。
 分数只是相对参考：同一份提示词跑两次分数也会波动，看多条用例的平均变化，不看单条。
@@ -41,10 +42,11 @@ JUDGE_SYSTEM = f"""\
 只输出 JSON：{{"scores": [每条一个整数], "reasons": [每条一句话], "top_fix": "..."}}"""
 
 
-def load_cases(path: Path = CASES_PATH) -> list[dict]:
-    """读取用例；same_brief_as 复用另一条用例的产品信息"""
-    cases = json.loads(path.read_text(encoding="utf-8"))["cases"]
-    by_id = {c["id"]: c for c in cases}
+def load_cases(path: Path = CASES_PATH, key: str = "cases") -> list[dict]:
+    """读取用例（key="ecom_cases" 读主图 / 详情页用例）；same_brief_as 复用视频用例的产品信息"""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    by_id = {c["id"]: c for c in data["cases"]}
+    cases = data.get(key) or []
     for c in cases:
         if "same_brief_as" in c:
             c["brief"] = by_id[c["same_brief_as"]]["brief"]
@@ -107,6 +109,42 @@ def run_case(case: dict, use_judge: bool = False, self_review: bool = False, ski
         result["judge"] = judge(case, sb)
     return result
 
+def run_ecom_case(case: dict, self_review: bool = False) -> dict:
+    """
+    主图 / 详情页用例：生成图文策划（1 次 LLM 调用，不生图），检查定位是否按渠道生效、
+    高端定位的主图没有价格、类目标准包的屏序，再加硬校验的 ❌ / ⚠️ 计数。
+    素材库按空库处理，结果与本机上传的照片无关
+    """
+    import ecom_images as ecom        # 只在跑图文用例时导入
+    brief = case["brief"]
+    playbook = cp.resolve(brief)
+    t0 = time.time()
+    try:
+        plan = ecom.generate_ecom_plan(
+            brief["name"], brief_mod.lines_of(brief.get("usp")), brief.get("brand_color", "#000000"),
+            case["platform"], main_count=5, product_context=brief_mod.brief_context(brief),
+            playbook=playbook, self_review=self_review, library=[], positioning=case.get("positioning", ""))
+    except Exception as e:
+        return {"id": case["id"], "error": str(e)[:300], "seconds": round(time.time() - t0, 1)}
+    issues = list(plan.get("quality_issues") or [])
+    position = plan["meta"]["positioning"]
+    if case.get("expect_positioning") and position != case["expect_positioning"]:
+        issues.insert(0, f"{qc.ERR} 定位是「{position}」，期望「{case['expect_positioning']}」")
+    if position == "premium" and any(m.get("price") for m in plan["main_images"]):
+        issues.insert(0, f"{qc.ERR} 高端定位的主图出现了价格")
+    expected = (cp.get(playbook).get("positioning_plans") or {}).get(position)
+    if expected and [d["role"] for d in plan["detail_sections"]] != expected:
+        issues.insert(0, f"{qc.ERR} 详情页屏序与类目标准包不一致")
+    return {
+        "id": case["id"], "playbook": playbook, "positioning": position, "seconds": round(time.time() - t0, 1),
+        "errors": sum(i.startswith(qc.ERR) for i in issues), "warnings": sum(i.startswith(qc.WARN) for i in issues),
+        "issues": issues, "self_reviewed": plan["meta"].get("self_reviewed"),
+        "plan": [f"{it['id']} {it['role'][:16]}｜{it.get('headline') or it.get('title', '')}"
+                 for it in plan["main_images"] + plan["detail_sections"]],
+    }
+
+
+
 
 def summarize(results: list[dict]) -> str:
     rows = [f"{'用例':<20}{'类目手册':<10}{'❌':>4}{'⚠️':>4}{'评分':>6}{'用时':>8}"]
@@ -131,16 +169,20 @@ def main(argv=None):
     ap.add_argument("--judge", action="store_true", help="加 LLM 评分（每条用例多 1 次调用）")
     ap.add_argument("--self-review", action="store_true", help="生成时开启模型自检")
     ap.add_argument("--no-skill", action="store_true", help="不注入 short-video-selling 技能（对比技能的作用）")
+    ap.add_argument("--ecom", action="store_true", help="跑主图 / 详情页用例（ecom_cases，每条 1 次 LLM 调用，不生图）")
+
     args = ap.parse_args(argv)
     sys.stdout.reconfigure(encoding="utf-8")
 
-    cases = [c for c in load_cases() if not args.case or c["id"] in args.case]
+    cases = [c for c in load_cases(key="ecom_cases" if args.ecom else "cases")
+             if not args.case or c["id"] in args.case]
     if not cases:
         sys.exit(f"没有匹配的用例：{args.case}")
     results = []
     for c in cases:
         print(f"▶ {c['id']} ...", flush=True)
-        results.append(run_case(c, args.judge, args.self_review, skill=not args.no_skill))
+        results.append(run_ecom_case(c, args.self_review) if args.ecom
+                       else run_case(c, args.judge, args.self_review, skill=not args.no_skill))
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     out = RESULTS_DIR / f"{time.strftime('%Y%m%d_%H%M%S')}.json"
     out.write_text(json.dumps({"args": vars(args), "results": results}, ensure_ascii=False, indent=2),

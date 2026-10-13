@@ -33,12 +33,15 @@ def custom_dir(tmp_path, monkeypatch):
 
 # ── 内置手册补漏 ───────────────────────────────────────────────────────────────
 @pytest.mark.parametrize("brief, key", [
-    (TEA, "food"),                                          # 「茶」也归食品，不再落到通用
-    ({"category": "花草茶"}, "food"),
+    (TEA, "tea"),                                           # 代用茶走商用标准包（parent 是食品）
+    ({"category": "花草茶"}, "tea"),
+    ({"category": "零食", "name": "奶茶味饼干"}, "food"),     # 只是「茶」字不算代用茶
     ({"category": "家居", "name": "实木茶几"}, "home"),       # 茶几不是食品
 ])
 def test_tea_detected_as_food(custom_dir, brief, key):
     assert cp.resolve(brief) == key
+    if key == "tea":
+        assert cp.get(key)["parent"] == "food"
 
 
 def test_food_compliance_covers_tea_claims():
@@ -82,14 +85,14 @@ def test_custom_roundtrip_and_delete(custom_dir):
     again = cp.save_custom(json.loads(cp.custom_to_text(key)))   # 界面编辑框的内容能原样存回去
     assert again == key and cp.load_custom()[key]["detail_overrides"] == {5: "产地溯源：张家界山区环境"}
     assert cp.delete_custom(key) and not cp.delete_custom(key)
-    assert cp.resolve({**TEA, "playbook": key}) == "food"         # 被删的手册退回自动识别
+    assert cp.resolve({**TEA, "playbook": key}) == "tea"          # 被删的手册退回自动识别
     assert not cp.delete_custom("food")
 
 
 def test_broken_custom_file_is_skipped(custom_dir):
     custom_dir.mkdir(parents=True)
     (custom_dir / "坏文件.json").write_text("{not json", encoding="utf-8")
-    assert cp.load_custom() == {} and cp.resolve(TEA) == "food"
+    assert cp.load_custom() == {} and cp.resolve(TEA) == "tea"
 
 
 def test_draft_playbook_uses_llm_and_normalizes(monkeypatch, custom_dir):

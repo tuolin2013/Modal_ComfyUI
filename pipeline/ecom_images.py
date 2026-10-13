@@ -9,7 +9,10 @@
   1. LLM 图文策划：每张图的作用、文案（标题/副标题/角标/要点）、画面提示词
   2. AI 参考图生图（right.codes 异步绘图接口 /draw/v1/images/generations，参考图放 image 字段，
      提交后轮询 /v1/tasks/{task_id}）：以真实产品图（+ 可选角色定妆照）为参考生成画面，
-     提示词要求完全保留产品外形、包装文字、logo 和配色，并为文字预留留白区
+     提示词要求完全保留产品外形、包装文字、logo 和配色，并为文字预留留白区。
+     主图和详情页都按素材库给每张分配参考照片（包装锁外观 + 原料 / 茶汤 / 叶底等内容照片）；
+     画面主体是真实产品内容、却没有对口照片的屏先不出图，等商家补拍。
+     多张并行（ECOM_CONCURRENCY，默认 4）：各自提交任务、各自轮询，每完成一张就存盘回显
   3. 文字由程序排版叠加，不让 AI 写中文：避免错别字，改字也不用重新生图。
      LLM 输出结构化文案（标题、角标、价格标签、参数表、主题色等）→ HTML/CSS 模板 → 无头 Chromium 截图
      （html_render.py）；Playwright / Chromium 不可用时退回 Pillow 简版排版
@@ -22,13 +25,17 @@
 """
 
 import base64
+import copy
 import io
 import json
 import os
 import re
 import shutil
+import threading
 import time
+import traceback
 import urllib.request
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from functools import lru_cache
 from pathlib import Path
 
@@ -36,8 +43,10 @@ import requests
 from markupsafe import Markup
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps, ImageStat
 
+import asset_library as al
 import html_render
 import category_playbook as cp
+import positioning as pos
 import quality_check as qc
 from layer1_planning import RIGHT_CODES_BASE_URL, RIGHT_CODES_LLM_KEY, PLANNING_MODEL, LLM_TIMEOUT
 from layer2_visual_assets import RIGHT_CODES_DRAW_KEY
@@ -45,8 +54,7 @@ from layer2_visual_assets import RIGHT_CODES_DRAW_KEY
 # ── 配置 ──────────────────────────────────────────────────────────────────────
 ECOM_DIR = Path(__file__).resolve().parent / "output" / "ecom"
 PLAN_PATH = ECOM_DIR / "plan.json"
-PRODUCT_DIR = ECOM_DIR / "product"     # 电商图专用的产品原图
-BASE_DIR = ECOM_DIR / "base"           # AI 生成的无字底图
+BASE_DIR = ECOM_DIR / "base"           # AI 生成的无字底图（实拍直出的底图也放这里）
 FINAL_DIR = ECOM_DIR / "final"         # 叠加文字后的成品（文件名即上传顺序）
 
 EDIT_MODEL = os.environ.get("ECOM_IMAGE_MODEL", "gpt-image-2.5")
@@ -55,6 +63,8 @@ DRAW_BASE_URL = os.environ.get("RIGHT_CODES_DRAW_URL", "https://www.rightapi.ai/
 TASK_URL = f"{RIGHT_CODES_BASE_URL.rstrip('/')}/tasks"   # https://www.rightapi.ai/v1/tasks/{task_id}
 POLL_INTERVAL = 5      # 秒
 POLL_TIMEOUT = 600     # 单张最长等待秒数
+# 同时出几张图：接口是「提交任务 → 轮询」，时间几乎都花在等待上，多张并行提交、各自轮询；平台限流（429）时调小
+CONCURRENCY = max(1, int(os.environ.get("ECOM_CONCURRENCY", "4")))
 # OpenAI 文档：input_fidelity=high 只在 gpt-image-1 / 1.5 上可用，gpt-image-2 系列需省略
 FIDELITY_MODELS = {"gpt-image-1", "gpt-image-1.5"}
 MAX_PRODUCT_REFS = 3
@@ -304,27 +314,34 @@ def item_issues(item: dict, playbook: str | None = None) -> list[str]:
 
 
 # ── 网络请求 ──────────────────────────────────────────────────────────────────
-def _request(send, retries: int = 3):
-    """临时移除 NO_PROXY（与其它层一致），并对 5xx / 网络异常重试"""
+def _proxies() -> dict:
+    """
+    系统代理（环境变量优先，没有就读 Windows 注册表 / macOS 系统设置），忽略 NO_PROXY（与其它层一致）。
+    显式传给 requests，不再临时删 os.environ 里的 NO_PROXY：环境变量是进程级的，多张图并行请求时会互相覆盖。
+    注意 urllib 的 getproxies() 只要设了 NO_PROXY 就不读系统设置，所以这里分两步取
+    """
+    env = {k: v for k, v in urllib.request.getproxies_environment().items() if k != "no"}
+    if env:
+        return env
+    system = getattr(urllib.request, "getproxies_registry", None) or \
+        getattr(urllib.request, "getproxies_macosx_sysconf", None)
+    return {k: v for k, v in (system() if system else {}).items() if k != "no"}
+
+
+def _request(method: str, url: str, retries: int = 3, **kw):
+    """对 5xx / 429 限流 / 网络异常重试"""
     resp = None
     for attempt in range(retries):
-        old = os.environ.pop("NO_PROXY", None)
-        old_l = os.environ.pop("no_proxy", None)
         try:
-            resp = send()
-            if resp.status_code < 500 or attempt == retries - 1:
+            resp = requests.request(method, url, proxies=_proxies(), **kw)
+            if (resp.status_code < 500 and resp.status_code != 429) or attempt == retries - 1:
                 return resp
-            print(f"[电商图] [{attempt + 1}/{retries}] 接口返回 {resp.status_code}，5 秒后重试...")
+            print(f"[电商图] [{attempt + 1}/{retries}] 接口返回 {resp.status_code}，稍后重试...")
         except requests.exceptions.RequestException as e:
             if attempt == retries - 1:
                 raise
-            print(f"[电商图] [{attempt + 1}/{retries}] 网络异常 ({type(e).__name__})，5 秒后重试...")
-        finally:
-            if old is not None:
-                os.environ["NO_PROXY"] = old
-            if old_l is not None:
-                os.environ["no_proxy"] = old_l
-        time.sleep(5)
+            print(f"[电商图] [{attempt + 1}/{retries}] 网络异常 ({type(e).__name__})，稍后重试...")
+        time.sleep(5 * (attempt + 1))
     return resp
 
 
@@ -332,14 +349,14 @@ def _chat_json(system: str, user, max_tokens: int = 12000, history: list[dict] |
                temperature: float = 0.7, model: str = "") -> dict:
     """history：自检时带上前一轮的 assistant 输出和修改要求；user 可以是多模态的 content 列表（图文核对用）"""
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user}] + (history or [])
-    resp = _request(lambda: requests.post(
-        f"{RIGHT_CODES_BASE_URL.rstrip('/')}/chat/completions",
+    resp = _request(
+        "POST", f"{RIGHT_CODES_BASE_URL.rstrip('/')}/chat/completions",
         headers={"Authorization": f"Bearer {RIGHT_CODES_LLM_KEY}", "Content-Type": "application/json",
                  "Connection": "close"},
         json={"model": model or PLANNING_MODEL, "temperature": temperature, "max_tokens": max_tokens,
               "response_format": {"type": "json_object"}, "messages": messages},
         timeout=max(LLM_TIMEOUT, 240.0),
-    ))
+    )
     if resp.status_code != 200:
         raise Exception(f"LLM 请求失败 ({resp.status_code}): {resp.text[:500]}")
     raw = resp.json()["choices"][0]["message"]["content"].strip()
@@ -367,7 +384,11 @@ def _save_image_response(data: dict, out_path: Path):
     if item.get("b64_json"):
         out_path.write_bytes(base64.b64decode(item["b64_json"]))
     elif item.get("url"):
-        urllib.request.urlretrieve(item["url"], str(out_path))
+        # 不用 urlretrieve：它没有超时，图床卡住时这张会一直挂着
+        resp = _request("GET", item["url"], timeout=120.0)
+        if resp.status_code != 200:
+            raise ServiceError(f"下载生成的图片失败 ({resp.status_code}): {_brief_error(resp)}")
+        out_path.write_bytes(resp.content)
     else:
         raise ValueError("图像接口响应中既没有 b64_json 也没有 url")
 
@@ -398,17 +419,15 @@ def _auth() -> dict:
 
 
 def _submit_draw(prompt: str, refs: list[tuple[bytes, str]], size: str, model: str):
-    """按 right.codes 文档提交异步绘图任务：参考图放 image（data URL 数组），async 固定 true"""
-    payload = {
-        "model": model, "prompt": prompt, "n": 1, "size": size, "async": True,
-        "image": [f"data:{mime};base64,{base64.b64encode(b).decode()}" for b, mime in refs],
-    }
-    if model in FIDELITY_MODELS:
+    """按 right.codes 文档提交异步绘图任务：参考图放 image（data URL 数组），async 固定 true；
+    没有参考图时（纯生成的屏）不带 image 字段"""
+    payload = {"model": model, "prompt": prompt, "n": 1, "size": size, "async": True}
+    if refs:
+        payload["image"] = [f"data:{mime};base64,{base64.b64encode(b).decode()}" for b, mime in refs]
+    if model in FIDELITY_MODELS and refs:
         payload["input_fidelity"] = "high"
-    return _request(lambda: requests.post(
-        f"{DRAW_BASE_URL.rstrip('/')}/images/generations",
-        headers={**_auth(), "Content-Type": "application/json"}, json=payload, timeout=120.0,
-    ))
+    return _request("POST", f"{DRAW_BASE_URL.rstrip('/')}/images/generations",
+                    headers={**_auth(), "Content-Type": "application/json"}, json=payload, timeout=120.0)
 
 
 def _task_error(task: dict) -> str:
@@ -425,11 +444,11 @@ def _poll_task(task_id: str) -> dict:
     while time.time() < deadline:
         time.sleep(POLL_INTERVAL)
         try:
-            resp = _request(lambda: requests.get(f"{TASK_URL}/{task_id}", headers=_auth(), timeout=60.0))
+            resp = _request("GET", f"{TASK_URL}/{task_id}", headers=_auth(), timeout=60.0)
         except requests.exceptions.RequestException as e:
             last = f"网络异常 {type(e).__name__}"
             continue
-        if resp.status_code >= 500:
+        if resp.status_code >= 500 or resp.status_code == 429:
             last = f"查询返回 {resp.status_code}"
             continue
         if resp.status_code != 200:
@@ -473,6 +492,8 @@ def _image_payload(data: dict) -> dict:
 
 def _draw_once(prompt: str, refs: list[tuple[bytes, str]], size: str, model: str, out_path: Path):
     resp = _submit_draw(prompt, refs, size, model)
+    if resp.status_code == 429:
+        raise ServiceError(f"绘图接口限流 (429)，已重试 3 次：在 .env 里把 ECOM_CONCURRENCY 调小（当前 {CONCURRENCY}）")
     if resp.status_code >= 500:
         raise ServiceError(f"绘图接口服务端错误 ({resp.status_code}): {_brief_error(resp)}，已重试 3 次")
     if not 200 <= resp.status_code < 300:
@@ -484,15 +505,17 @@ def _draw_once(prompt: str, refs: list[tuple[bytes, str]], size: str, model: str
         task_id = data.get("task_id") or data.get("id")
         if not task_id:
             raise Exception(f"提交成功但没拿到 task_id：{str(data)[:300]}")
-        print(f"[电商图]   已提交任务 {task_id}，每 {POLL_INTERVAL} 秒查询一次")
+        print(f"[电商图]   {out_path.stem} 已提交任务 {task_id}，每 {POLL_INTERVAL} 秒查询一次")
         data = _poll_task(task_id)
     _save_image_response(_image_payload(data), out_path)
 
 
-def edit_image(prompt: str, ref_paths: list[str], out_path: Path, ratio: str, model: str = EDIT_MODEL) -> Path:
-    """以参考图为基础生成 ratio 比例的新图（right.codes 异步绘图接口：提交任务 → 轮询结果）"""
+def edit_image(prompt: str, ref_paths: list[str], out_path: Path, ratio: str, model: str = EDIT_MODEL,
+               allow_empty: bool = False) -> Path:
+    """以参考图为基础生成 ratio 比例的新图（right.codes 异步绘图接口：提交任务 → 轮询结果）。
+    allow_empty：允许不带参考图（纯生成、不出现产品的屏）"""
     global _custom_size_ok
-    if not ref_paths:
+    if not ref_paths and not allow_empty:
         raise ValueError("参考图生图至少需要 1 张产品图")
     refs = [_encode_ref(p) for p in ref_paths[:MAX_EDIT_REFS]]
     size = GEN_SIZES[ratio] if _custom_size_ok else FALLBACK_GEN_SIZES[ratio]
@@ -565,6 +588,12 @@ PLAN_SYSTEM = """\
    recurring props: a clear glass mug, a small bamboo tray; 50mm lens, shallow depth of field, gentle film grain"）。
    系统会把它拼进每一张图的提示词，所以各张的 scene_prompt_en 不要和它矛盾，也不用重复它。
    场景图不要出现医院、医生、药品、病床，也不要表现生病难受的人。
+9. 详情页每屏后面【】里是程序按商家的实拍素材分配好的出图方式和拍法，照着写：
+   - 【实拍直出】这屏直接用商家的实拍照片（放在下方），scene_prompt_en 留空，文案围绕照片里看得见的内容写；
+   - 【参考重绘】按给定拍法写 scene_prompt_en，提到的素材照片会作为参考图（内容以照片为准，不要另行描述外观）；
+   - 【纯生成】画面里不出现产品和包装。
+   只有【实拍直出】的屏可以在文案里写「实拍」「实物图」「产地实景」；其它屏是 AI 画面，不能这样说。
+   主图后面的【参考重绘 · 素材：…】同理：那张照片会作为参考图，画面围绕照片里的真实内容来写，不要另行描述它的外观。
 
 输出纯 JSON，不加 markdown：
 {
@@ -594,6 +623,8 @@ def generate_ecom_plan(
     product_context: str = "",
     playbook: str = cp.GENERAL,
     self_review: bool = False,
+    library: list[dict] | None = None,
+    positioning: str = "",
 ) -> dict:
     """
     生成主图 + 15 屏详情页的图文策划。
@@ -601,16 +632,29 @@ def generate_ecom_plan(
     characters: 可出镜的角色（需已有定妆照）
     playbook: 类目手册 key，决定详情页屏序、类目要点和类目合规词
     self_review: 生成后按评分标准 + 程序检查结果让模型再改一轮（多一次 LLM 调用）
+    library: 产品素材库（默认读 asset_library）。有素材时先给每屏分配素材和出图方式，再让 LLM 按分配写文案
+    positioning: 产品定位（positioning.POSITIONINGS 的键）；空或「跟随平台」时按平台默认。决定详情页屏序、语气、
+                 画面方向和价格策略
     """
     spec = ECOM_PLATFORMS.get(platform, ECOM_PLATFORMS[DEFAULT_ECOM_PLATFORM])
     main_count = int(main_count) if int(main_count) in MAIN_COUNTS else MAIN_COUNTS[0]
     main_ratio = main_ratio if main_ratio in MAIN_RATIOS else MAIN_RATIOS[0]
     roles = spec["main_roles"][:main_count]
-    detail_roles_list = cp.detail_roles(DETAIL_ROLES, playbook)
+    position = pos.resolve(positioning, platform)
+    detail_roles_list = pos.detail_roles(cp.detail_roles(DETAIL_ROLES, playbook), position,
+                                         cp.get(playbook).get("positioning_plans"))
+    lib = al.load_library() if library is None else library
+    assets = al.assign(detail_roles_list, lib) if lib else None
+    main_assets = al.assign(roles, lib, main=True) if lib else None
+    shots = al.plan_shots(detail_roles_list, assets)
     characters = characters or []
     char_ids = {c["id"] for c in characters}
-    main_roles = "\n".join(f"{i}. {r}" for i, r in enumerate(roles, 1))
-    detail_roles = "\n".join(f"{i}. {r}" for i, r in enumerate(detail_roles_list, 1))
+    main_roles = "\n".join(
+        f"{i}. {r}{'' if '白底' in r or not main_assets else asset_hint(main_assets[i - 1], '', lib)}"
+        for i, r in enumerate(roles, 1))
+    detail_roles = "\n".join(f"{i}. {r}{asset_hint(assets[i - 1] if assets else None, shots[i - 1], lib)}"
+                             for i, r in enumerate(detail_roles_list, 1))
+    product_context = "\n".join(s for s in (product_context, al.label_context(lib)) if s)
     chars_text = "\n".join(
         f"- {c['id']} {c.get('name', '')}（{c.get('role', '')}）：{c.get('appearance_zh', '')}" for c in characters
     ) or "（无，不安排真人出镜，use_characters 一律填 []）"
@@ -622,6 +666,7 @@ def generate_ecom_plan(
 品牌主色：{brand_color}
 {product_context}
 {cp.prompt_block(playbook, "ecom")}
+{pos.prompt_block(position, "ecom")}
 目标平台：{platform}
 平台特点：{spec['guide']}
 
@@ -634,9 +679,16 @@ def generate_ecom_plan(
 以及 {len(detail_roles_list)} 屏详情页，按顺序对应：
 {detail_roles}
 """
+
+    def build(raw_plan):
+        p = attach_assets(_normalize_plan(raw_plan, roles, main_ratio, char_ids, detail_roles_list), assets, shots,
+                          main_assets)
+        pos.apply_price_policy(p["main_images"], position)
+        return p
+
     raw = _chat_json(PLAN_SYSTEM, user)
-    plan = _normalize_plan(raw, roles, main_ratio, char_ids, detail_roles_list)
-    issues = review_plan(plan, usp, playbook, raw.get("art_direction"))
+    plan = build(raw)
+    issues = review_plan(plan, usp, playbook, raw.get("art_direction"), lib, product_context)
     reviewed = False
     if self_review:
         try:
@@ -644,21 +696,169 @@ def generate_ecom_plan(
                 {"role": "assistant", "content": json.dumps(raw, ensure_ascii=False)},
                 {"role": "user", "content": qc.revision_request(qc.ECOM_RUBRIC, issues)},
             ], temperature=0.4)
-            new_plan = _normalize_plan(revised, roles, main_ratio, char_ids, detail_roles_list)
-            new_issues = review_plan(new_plan, usp, playbook, revised.get("art_direction"))
+            new_plan = build(revised)
+            new_issues = review_plan(new_plan, usp, playbook, revised.get("art_direction"), lib, product_context)
             # 按严重程度比较：改稿引入新的 ❌ 或总分变差（模型偶尔删内容）就保留原稿
             if qc.accept_revision(issues, new_issues):
                 raw, plan, issues, reviewed = revised, new_plan, new_issues, True
         except Exception as e:      # 自检失败不影响初稿
             print(f"[电商图] 模型自检失败，保留初稿：{e}")
+    # 定位的画面方向由程序拼进视觉设定（不靠 LLM 记得写），整套图都带上
+    art = "; ".join(s for s in (clean_art_direction(raw.get("art_direction")), pos.get(position)["visual"]) if s)
     plan["meta"] = {"platform": platform, "product_name": product_name, "brand_color": brand_color,
                     "theme_color": _theme_color(raw.get("theme_color"), brand_color),
-                    "art_direction": clean_art_direction(raw.get("art_direction")),
+                    "art_direction": art[:600], "positioning": position,
                     "main_count": main_count, "main_ratio": main_ratio,
-                    "playbook": playbook, "self_reviewed": reviewed,
+                    "playbook": playbook, "self_reviewed": reviewed, "library_sig": al.signature(lib),
                     "created": time.strftime("%Y-%m-%d %H:%M:%S")}
     plan["quality_issues"] = issues
     return plan
+
+
+def asset_hint(a: dict | None, shot: str, lib: list[dict]) -> str:
+    """策划输入里每屏后面的【出图方式 · 拍法 · 素材】"""
+    if not a:
+        return f"【拍法：{al.shot_label(shot)}】" if shot else ""
+    content = al.find(lib, a.get("content") or "")
+    if a["mode"] == "photo":
+        return f"【实拍直出：{al.describe(content)}】"
+    bits = [al.MODES[a["mode"]]] + ([f"拍法：{al.shot_label(shot)}"] if shot else [])
+    if content:
+        bits.append(f"素材：{al.describe(content)}")
+    if a.get("needs_photo"):
+        bits.append(f"待补拍「{al.type_label(a.get('missing') or al.DEFAULT_TYPE)}」，文案只写照片能证实的内容")
+    return "【" + " · ".join(bits) + "】"
+
+
+def attach_assets(plan: dict, assets: list[dict] | None, shots: list[str],
+                  main_assets: list[dict] | None = None) -> dict:
+    """把素材分配和拍法写进详情页每屏、素材分配写进主图（白底图除外）；实拍直出的屏不需要画面描述"""
+    for i, m in enumerate(plan.get("main_images", [])):
+        if main_assets and i < len(main_assets) and main_assets[i] and not m.get("white_bg"):
+            m["assets"] = dict(main_assets[i])
+    for i, d in enumerate(plan.get("detail_sections", [])):
+        d["shot"] = shots[i] if i < len(shots) else ""
+        if assets and i < len(assets) and assets[i]:
+            d["assets"] = dict(assets[i])
+            if assets[i]["mode"] == "photo":
+                d["scene_prompt_en"] = ""
+    return plan
+
+
+# 只有实拍直出的屏能这样说；AI 画面写「实拍」属于虚假宣传风险
+REAL_PHOTO_CLAIM = re.compile(r"实拍|实物图|实物拍摄|产地实景|实景拍摄|真实拍摄|无修图")
+
+
+def check_assets(plan: dict, lib: list[dict] | None = None) -> list[str]:
+    """素材相关的检查：AI 画面却写「实拍」、详情页雷同、缺照片类型"""
+    details = plan.get("detail_sections", [])
+    issues = []
+    for d in details:
+        mode = (d.get("assets") or {}).get("mode")
+        hit = REAL_PHOTO_CLAIM.search(qc.item_texts(d))
+        if hit and mode != "photo":
+            issues.append(f"{qc.ERR} {d['id']} 文案写了「{hit.group()}」，但这屏是 AI 画面，"
+                          "请改文案或在卡片上换成实拍直出")
+    blocked = [d["id"] for d in details if (d.get("assets") or {}).get("needs_photo")]
+    if blocked:
+        issues.append(f"{qc.WARN} {'、'.join(blocked)} 画面主体是真实的产品内容，素材库里却没有对口的照片："
+                      "补拍前这几屏不出图（免得 AI 凭空画），也可以在卡片上手动选出图方式")
+    pending = [e["id"] for e in lib or [] if e.get("type_source") == "pending"]
+    if pending:
+        issues.append(f"{qc.WARN} {'、'.join(pending)} 还没识别类型，分配素材时只能当包装图用；"
+                      "点「🤖 自动识别类型」或手动选类型")
+    issues += [f"{qc.WARN} {s}" for s in al.check_variety(details)]
+    if lib is not None and not lib:
+        issues.append(f"{qc.INFO} 素材库是空的：详情页全部是 AI 画面，建议上传包装正反面和产品实拍")
+    missing = al.missing_types([d.get("assets") for d in details])
+    if missing:
+        issues.append(f"{qc.INFO} 建议补拍：{'、'.join(missing)}（补拍后会自动换上）")
+    return issues
+
+
+def reassign_assets(plan: dict, lib: list[dict], keep_manual: bool = True) -> dict:
+    """
+    素材库变了（补拍、改类型、删图）后重新分配详情页素材和拍法，文案不动。
+    keep_manual：卡片上手动指定过的屏（source = user）保持不变，且素材还在库里
+    返回 {"changed": [屏 id], "issues": [...]}；换了素材的屏下次生成时会重出底图（见 needs_regen）
+    """
+    details = plan.get("detail_sections", [])
+    roles = [d["role"] for d in details]
+    ids = {e["id"] for e in lib}
+
+    def manual(items):
+        return {i: d["assets"] for i, d in enumerate(items)
+                if keep_manual and (d.get("assets") or {}).get("source") == "user"
+                and all(r in ids for r in d["assets"].get("refs") or [])}
+
+    changed = []
+    mains = [m for m in plan.get("main_images", []) if not m.get("white_bg")]
+    fixed = manual(mains)
+    main_assets = al.assign([m["role"] for m in mains], lib, fixed=fixed, main=True) if lib else [None] * len(mains)
+    for i, m in enumerate(mains):
+        if i in fixed:
+            continue
+        old = (m.get("assets") or {}).get("refs"), (m.get("assets") or {}).get("mode")
+        if main_assets[i]:
+            m["assets"] = dict(main_assets[i])
+        else:
+            m.pop("assets", None)
+        if ((m.get("assets") or {}).get("refs"), (m.get("assets") or {}).get("mode")) != old:
+            changed.append(m["id"])
+
+    fixed = manual(details)
+    assets = al.assign(roles, lib, fixed=fixed) if lib else [None] * len(details)
+    shots = al.plan_shots(roles, assets)
+    for i, d in enumerate(details):
+        old = (d.get("assets") or {}).get("refs"), (d.get("assets") or {}).get("mode"), d.get("shot")
+        if i not in fixed:
+            if assets[i]:
+                d["assets"] = dict(assets[i])
+            else:
+                d.pop("assets", None)
+            d["shot"] = shots[i]
+        new = (d.get("assets") or {}).get("refs"), (d.get("assets") or {}).get("mode"), d.get("shot")
+        if new != old:
+            changed.append(d["id"])
+    plan.setdefault("meta", {})["library_sig"] = al.signature(lib)
+    return {"changed": changed, "issues": check_assets(plan, lib)}
+
+
+def sync_assets(plan: dict, lib: list[dict]) -> dict | None:
+    """
+    策划之后补拍 / 删图 / 改了照片类型（素材库指纹和策划时不同）：重新分配素材，手动指定过的屏不动。
+    素材库没变返回 None；变了返回 reassign_assets 的结果
+    """
+    if not plan.get("main_images") or (plan.get("meta") or {}).get("library_sig") == al.signature(lib):
+        return None
+    return reassign_assets(plan, lib)
+
+
+def set_item_asset(item: dict, lib: list[dict], content_id: str = "", mode: str = "", shot: str = "",
+                   main: bool = False) -> dict:
+    """
+    卡片上手动改这一屏：内容照片（"" = 不指定）、出图方式（"" = 自动）、拍法。记为 source = user，
+    重新分配素材时保持不变。main：主图（不实拍直出、没有拍法）
+    """
+    need = al.role_need(item.get("role", ""), main)
+    content = al.find(lib, content_id) if content_id else None
+    if main and mode == "photo":
+        mode = ""
+    a = al.plan_one(need, content, al.package_refs(lib, 2), allow_photo=not main,
+                    mode=mode if mode in al.MODES else "")
+    if content and content.get("type") in need["types"]:
+        a["missing"] = ""
+    a["source"] = "user"
+    item["assets"] = a
+    if main:
+        return a
+    if a["mode"] == "photo":
+        item["shot"] = "photo"
+    elif shot in al.SHOTS:
+        item["shot"] = shot
+    elif item.get("shot") in ("", "photo", None):
+        item["shot"] = need["shots"][0]
+    return a
 
 
 def clean_art_direction(value) -> str:
@@ -671,10 +871,12 @@ def clean_art_direction(value) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()[:500]
 
 
-def review_plan(plan: dict, usp: list[str], playbook: str | None = None, art_direction: str = "") -> list[str]:
+def review_plan(plan: dict, usp: list[str], playbook: str | None = None, art_direction: str = "",
+                lib: list[dict] | None = None, source: str = "") -> list[str]:
     """
     整套图文的硬校验：字数、重复、卖点覆盖 + 逐张的广告法/类目合规（不含【占位】，占位由商家填）
-    + 画面描述里暗示医疗场景或疗效的词
+    + 画面描述里暗示医疗场景或疗效的词 + 素材检查（AI 画面写「实拍」、相邻屏雷同、缺照片）
+    + 商用标准包：文案里没有依据的说法（source 是产品信息原文）
     """
     issues = qc.check_ecom_plan(plan, usp)
     for it in plan.get("main_images", []) + plan.get("detail_sections", []):
@@ -687,7 +889,8 @@ def review_plan(plan: dict, usp: list[str], playbook: str | None = None, art_dir
     visual = qc.check_visual(clean_art_direction(art_direction))
     if visual:
         issues.append(f"{qc.WARN} 整套视觉设定 {'、'.join(visual)}，画面不要暗示医疗场景或疗效")
-    return issues
+    copy = "\n".join(qc.item_texts(it) for it in plan.get("main_images", []) + plan.get("detail_sections", []))
+    return issues + check_assets(plan, lib) + qc.check_evidence(copy, source, playbook)
 
 
 def _str_list(v, limit):
@@ -836,71 +1039,77 @@ EXPORT_DIR = ECOM_DIR / "exports"      # 历次打包的 zip，清空时保留
 def clear_all():
     """开始新产品：清掉策划、底图、成品和本页产品图；已打包的 zip（exports/）保留"""
     reset_outputs()
-    if PRODUCT_DIR.exists():
-        shutil.rmtree(PRODUCT_DIR)
+    al.clear_library()
     if PLAN_PATH.exists():
         PLAN_PATH.unlink()
 
 
-def product_slot_path(slot: int) -> str | None:
-    """第 slot 个产品图位（1 起）当前的文件路径，没有则 None"""
-    if not PRODUCT_DIR.exists():
-        return None
-    hits = sorted(PRODUCT_DIR.glob(f"product_{slot}.*"))
-    return str(hits[0]) if hits else None
-
-
-def set_product_image(slot: int, path: str | None) -> str | None:
-    """设置/删除第 slot 个产品图位：path 为 None 时删除。返回保存后的路径"""
-    if not 1 <= slot <= MAX_PRODUCT_REFS:
-        raise ValueError(f"产品图位只有 1-{MAX_PRODUCT_REFS}")
-    PRODUCT_DIR.mkdir(parents=True, exist_ok=True)
-    for old in PRODUCT_DIR.glob(f"product_{slot}.*"):
-        old.unlink()
-    if not path:
-        return None
-    dest = PRODUCT_DIR / f"product_{slot}{Path(path).suffix.lower() or '.png'}"
-    shutil.copy(path, dest)
-    return str(dest)
-
-
 def get_product_images() -> list[str]:
-    """按图位顺序返回已上传的产品图（图 1 作为主参考）"""
-    return [p for p in (product_slot_path(i) for i in range(1, MAX_PRODUCT_REFS + 1)) if p]
+    """锁定产品外观用的包装图（素材库里包装正面优先，最多 MAX_PRODUCT_REFS 张）"""
+    return [e["path"] for e in al.package_refs(al.load_library(), MAX_PRODUCT_REFS)]
 
 
-# 每个图位的角度/内容说明（如"正面平视"），视频剧本据此给镜头选图
-PRODUCT_LABELS_PATH = PRODUCT_DIR / "labels.json"
+def product_slots(extra: int = 3) -> list[tuple[int, str, str]]:
+    """给视频产品镜头图用的参考：包装图在前，再加最多 extra 张内容照片（干品、冲泡、原料…）。
+    [(序号, 路径, 中文说明)]，序号从 1 起"""
+    lib = al.load_library()
+    pkg = al.package_refs(lib, MAX_PRODUCT_REFS)
+    ids = {e["id"] for e in pkg}
+    others = [e for e in lib if e["id"] not in ids and e.get("type") not in al.PHOTO_ONLY_TYPES][:extra]
+    return [(i, e["path"], al.describe(e)) for i, e in enumerate(pkg + others, 1)]
 
 
-def get_product_labels() -> dict[int, str]:
-    try:
-        data = json.loads(PRODUCT_LABELS_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return {int(k): str(v) for k, v in data.items() if str(k).isdigit() and str(v).strip()}
+# ── 素材自动分类：视觉模型给每张照片打类型；包装背面顺带读出标签字段 ─────────────────
+TAG_BATCH = 6          # 每次调用最多送几张（图越多越容易漏答、错位）
+TAG_SYSTEM = f"""\
+你是电商美工助理。用户上传了同一个商品的多张照片，请逐张判断类型。类型只能从下面选（填英文 key）：
+{al.tag_guide()}
+
+规则：
+1. 一张照片只给一个最主要的类型。包装正面清晰可见时优先判为 package_front，即使背景是生活场景。
+2. note：用中文写这张照片的内容，≤ 12 字（如「玻璃杯里的琥珀色茶汤」「三袋装礼盒」）。
+3. 判为 package_back 的照片，把能看清的标签信息抄进 label_fields（照抄原文，看不清的项不写，绝不推测）：
+   可能有的项：产品名称、配料 / 原料组成、添加剂组成、净含量、规格、保质期、贮存条件、生产日期、
+   生产许可证编号、执行标准、产地、生产商、适用对象、用法用量、成分分析保证值。其它类型的照片 label_fields 为 {{}}。
+只输出 JSON：{{"photos": [{{"index": 1, "type": "...", "note": "...", "label_fields": {{}}}}]}}，index 是照片序号（从 1 起）。"""
 
 
-def product_label(slot: int) -> str:
-    return get_product_labels().get(slot, "")
-
-
-def set_product_label(slot: int, text: str):
-    labels = get_product_labels()
-    text = (text or "").strip()
-    if text:
-        labels[slot] = text
-    else:
-        labels.pop(slot, None)
-    PRODUCT_DIR.mkdir(parents=True, exist_ok=True)
-    PRODUCT_LABELS_PATH.write_text(json.dumps({str(k): v for k, v in labels.items()}, ensure_ascii=False),
-                                   encoding="utf-8")
-
-
-def product_slots() -> list[tuple[int, str, str]]:
-    """已上传的图位：[(图位号, 路径, 说明)]，按图位顺序"""
-    labels = get_product_labels()
-    return [(i, p, labels.get(i, "")) for i in range(1, MAX_PRODUCT_REFS + 1) if (p := product_slot_path(i))]
+def classify_photos(entries: list[dict], model: str = "") -> tuple[int, list[str]]:
+    """
+    给素材库照片打类型（结果直接写回素材库，type_source = "auto"）。返回 (识别成功张数, 失败说明)。
+    用户改过类型的照片不要传进来（见 asset_library.needs_tagging）
+    """
+    done, errors = 0, []
+    for start in range(0, len(entries), TAG_BATCH):
+        batch = entries[start:start + TAG_BATCH]
+        content = [{"type": "text", "text": f"共 {len(batch)} 张照片，按顺序编号 1-{len(batch)}。"}]
+        for k, e in enumerate(batch, 1):
+            content += [{"type": "text", "text": f"照片 {k}："},
+                        {"type": "image_url", "image_url": {"url": _data_url(e["path"])}}]
+        try:
+            raw = _chat_json(TAG_SYSTEM, content, max_tokens=2000, temperature=0.0, model=model or CHECK_MODEL)
+        except Exception as ex:
+            errors.append(f"{'、'.join(e['id'] for e in batch)} 识别失败（{type(ex).__name__}: {str(ex)[:120]}）")
+            continue
+        items = raw.get("photos") if isinstance(raw, dict) else []
+        fields = {}
+        for k, it in enumerate(items if isinstance(items, list) else []):
+            if isinstance(it, dict):
+                try:
+                    fields[int(it.get("index")) - 1] = it.get("label_fields")
+                except (TypeError, ValueError):
+                    fields[k] = it.get("label_fields")
+        for k, (e, tag) in enumerate(zip(batch, al.normalize_tags(raw, len(batch)))):
+            if not tag:
+                errors.append(f"{e['id']} 模型没有给出结果")
+                continue
+            kind, note = tag
+            update = {"type": kind, "note": note or e.get("note", "")}
+            if kind == "package_back":
+                update["label_fields"] = fields.get(k)
+            al.update_photo(e["id"], type_source="auto", **update)
+            done += 1
+    return done, errors
 
 
 def find_item(plan: dict, kind: str, item_id: str) -> dict | None:
@@ -919,14 +1128,30 @@ def has_text(item: dict) -> bool:
     return bool(item_texts(item).strip())
 
 
-def needs_regen(item: dict, text_mode: str) -> bool:
-    """底图是否需要重新生成：没有底图，或底图的写字方式与当前选择不同（无字的图不受影响）"""
+def needs_regen(item: dict, text_mode: str, kind: str = "detail", lib: list[dict] | None = None) -> bool:
+    """
+    底图是否需要重新生成：没有底图；底图的写字方式与当前选择不同（无字的图、实拍直出的图不受影响）；
+    或者传了素材库、且这屏换过素材 / 出图方式（base_key 对不上）
+    """
     if not (item.get("base_path") and os.path.exists(item["base_path"])):
         return True
+    if lib is not None and item.get("base_key", "legacy") != asset_key(item, kind, lib) \
+            and not _legacy_main_same(item, kind, lib):
+        return True
+    if item.get("base_mode") == "photo":
+        return False
     return has_text(item) and item.get("base_mode", DEFAULT_TEXT_MODE) != text_mode
 
 
 # ── 生成画面 ──────────────────────────────────────────────────────────────────
+def _legacy_main_same(item: dict, kind: str, lib: list[dict]) -> bool:
+    """旧版主图（base_key = legacy）本来就只用包装图出图：现在补记了素材分配、但没用到包装以外的照片，不算换素材"""
+    a = item.get("assets") or {}
+    content = al.find(lib, a.get("content") or "")
+    return kind == "main" and item.get("base_key", "legacy") == "legacy" and a.get("mode") == "reference" \
+        and (not content or content.get("type") in al.PACKAGE_TYPES)
+
+
 def _ai_text_block(item: dict, kind: str, brand_hex: str) -> list[str]:
     """AI 写字模式：把文案和版式要求写进提示词"""
     def q(s):
@@ -997,36 +1222,53 @@ def _ai_text_block(item: dict, kind: str, brand_hex: str) -> list[str]:
 
 
 def build_edit_prompt(item: dict, kind: str, n_product: int, chars: list[dict],
-                      text_mode: str = DEFAULT_TEXT_MODE, brand_hex: str = "", art_direction: str = "") -> str:
-    """art_direction：整套图共用的视觉设定（plan.meta.art_direction），白底图不用"""
+                      text_mode: str = DEFAULT_TEXT_MODE, brand_hex: str = "", art_direction: str = "",
+                      refs: list[dict] | None = None, content_id: str = "") -> str:
+    """
+    art_direction：整套图共用的视觉设定（plan.meta.art_direction），白底图不用
+    refs：素材库里分配给这一屏的参考图条目（包装在前）。None 时按旧方式把 n_product 张都当产品图；
+          [] 表示纯生成，画面里不出现产品
+    content_id：refs 里哪一张是内容照片（原料、茶汤、叶底…），其余是锁定产品外观的包装图
+    """
     ratio = item.get("ratio", "1:1")
     ai_text = _ai_text_block(item, kind, brand_hex or "#C8A882") if text_mode == "ai" else []
     lines = []
-    if n_product == 1:
-        lines.append("Reference image 1 is the real product.")
+    if refs is None:
+        if n_product == 1:
+            lines.append("Reference image 1 is the real product.")
+        else:
+            lines.append(f"Reference images 1-{n_product} show the same real product from different angles.")
+        has_product = True
     else:
-        lines.append(f"Reference images 1-{n_product} show the same real product from different angles.")
-    lines.append(
-        "Reproduce this product exactly as in the reference: same shape, proportions, packaging text, logo, "
-        "colors, materials and label layout. Do not redesign, retype, translate or blur any text printed on it."
-    )
+        lines += _ref_lines(refs, content_id)
+        n_product = len(refs)
+        has_product = any(_is_product_ref(r, content_id) for r in refs)
+    if has_product:
+        lines.append(
+            "Reproduce this product exactly as in the reference: same shape, proportions, packaging text, logo, "
+            "colors, materials and label layout. Do not redesign, retype, translate or blur any text printed on it.")
+    else:
+        lines.append("Do not show the product, its packaging or any branded item in this image.")
     for k, c in enumerate(chars, n_product + 1):
         lines.append(f"Reference image {k} is a portrait of the model {c.get('name', c['id'])}; "
                      f"the person in the image must be this exact person with the same face, hairstyle and outfit.")
 
     frame = "Square 1:1" if ratio == "1:1" else "Vertical 3:4"
+    subject = "product" if has_product else "main subject"
     if item.get("white_bg"):
         lines.append(f"{frame} image. Pure white background (#FFFFFF), product front view centered and filling "
                      f"about 80% of the frame width, soft natural contact shadow only, no props, no people.")
     else:
         if art_direction:
             lines.append(f"Shared art direction for the whole image set (keep consistent): {art_direction}.")
+        if al.shot_prompt(item.get("shot", "")):
+            lines.append(f"Shot type: {al.shot_prompt(item['shot'])}.")
         lines.append(item.get("scene_prompt_en", ""))
         purpose = "the typeset text below" if ai_text else "a text overlay"
         if kind == "main":
             area = "top" if item.get("text_position") != "bottom" else "bottom"
             lines.append(f"{frame} e-commerce main image. Keep the {area} third of the frame as clean, uncluttered "
-                         f"background for {purpose}; the product must not overlap that area.")
+                         f"background for {purpose}; the {subject} must not overlap that area.")
         else:
             share = detail_share(item)
             what = {"steps": "a step-by-step infographic", "grid": "an icon feature grid",
@@ -1034,7 +1276,7 @@ def build_edit_prompt(item: dict, kind: str, n_product: int, chars: list[dict],
             lines.append(f"Vertical 3:4 e-commerce detail page section. Keep the top {round(share * 100)}% of the frame "
                          f"as clean, softly lit, low-contrast, uncluttered background for "
                          f"{what + ' and ' if what and not ai_text else ''}{purpose}; "
-                         f"the product sits in the lower part.")
+                         f"the {subject} sits in the lower part.")
     if ai_text:
         lines += ai_text
         lines.append("Apart from the text specified above and what is printed on the product, "
@@ -1045,24 +1287,214 @@ def build_edit_prompt(item: dict, kind: str, n_product: int, chars: list[dict],
     return "\n".join(l for l in lines if l)
 
 
+def _is_product_ref(r: dict, content_id: str = "") -> bool:
+    """
+    锁定产品外观的参考图：包装类照片，或不是这屏内容照片的参考图（分配时作为包装图带上的；
+    照片还没识别类型时 package_refs 会退回其它照片，这些也是商家的产品照）
+    """
+    return r.get("type") in al.PACKAGE_TYPES or r.get("id") != content_id
+
+
+# 环境类照片：画面就是那个真实的地方，不能换成别处
+_KEEP_SCENE_TYPES = {"raw_material", "lifestyle"}
+
+
+def _ref_lines(refs: list[dict], content_id: str = "") -> list[str]:
+    """
+    逐张说明参考图是什么、怎么用：包装图锁外观；内容照片里的东西照着画、不凭空捏造，
+    产品类内容（干茶、茶汤、叶底）可以换角度和构图，原料 / 产地这类环境照片保留真实环境
+    """
+    lines = []
+    for k, r in enumerate(refs, 1):
+        what = al.PHOTO_TYPES.get(r.get("type"), al.PHOTO_TYPES[al.DEFAULT_TYPE])[1]
+        if r.get("type") in al.PACKAGE_TYPES:
+            lines.append(f"Reference image {k} shows {what}.")
+        elif _is_product_ref(r, content_id):
+            lines.append(f"Reference image {k} is a real photo of the product as sold (its packaging and appearance).")
+        elif r.get("type") in _KEEP_SCENE_TYPES:
+            lines.append(f"Reference image {k} is a real photo of {what}. Depict this real place, its plants, objects "
+                         "and colors faithfully; you may change the framing and light for the shot described below, "
+                         "but do not invent a different place or different-looking plants.")
+        else:
+            lines.append(f"Reference image {k} is a real photo of {what}. Keep its true colors, shape, size and "
+                         "texture exactly; do not invent a different look. Recompose it for the shot described below; "
+                         "do not copy the photo's background or framing.")
+    return lines
+
+
 def render_item(plan: dict, kind: str, item: dict, product_paths: list[str], portraits: dict[str, dict],
-                text_mode: str = DEFAULT_TEXT_MODE) -> str:
+                text_mode: str = DEFAULT_TEXT_MODE, library: list[dict] | None = None) -> str:
     """
     生成底图并出成品。portraits: {角色id: 角色dict(含 image_path)}
     text_mode="overlay"：底图无字，再由程序叠字；"ai"：AI 直接把文案画进图里，成品只做裁切缩放
+    详情页按 item["assets"] 出图：实拍直出（本地合成、不调接口，文字一律程序叠加）/ 参考重绘 / 纯生成
     """
     text_mode = text_mode if text_mode in TEXT_MODES else DEFAULT_TEXT_MODE
+    lib = al.load_library() if library is None else library
+    mode, refs = _resolve_refs(item, kind, lib)
+    a = item.get("assets") or {}
+    if a.get("needs_photo") and mode != "photo":
+        raise NeedsPhoto(f"缺「{al.type_label(a.get('missing') or al.DEFAULT_TYPE)}」实拍照片，没有出图（免得 AI 凭空画）："
+                         "在卡片上传这屏的参考照片，或手动选出图方式")
+    out = BASE_DIR / f"{item['id']}_base.png"
+    item.pop("fidelity", None)      # 新画面，旧的核对结果作废
+    if mode == "photo":
+        item["base_path"] = str(photo_base(item, kind, refs[0]["path"], out))
+        item["base_mode"], item["base_key"] = "photo", asset_key(item, kind, lib)
+        return compose_item(plan, kind, item)
     chars = [portraits[c] for c in item.get("use_characters", []) if c in portraits]
-    products = product_paths[:MAX_PRODUCT_REFS]
+    paths = product_paths[:MAX_PRODUCT_REFS] if refs is None else [e["path"] for e in refs]
+    if not paths and mode != "generate":
+        raise ValueError("参考图生图至少需要 1 张产品图")
     brand_hex = _hex(plan_color(plan))
     art = (plan.get("meta") or {}).get("art_direction", "")
-    prompt = build_edit_prompt(item, kind, len(products), chars, text_mode, brand_hex, art)
-    base = edit_image(prompt, products + [c["image_path"] for c in chars],
-                      BASE_DIR / f"{item['id']}_base.png", item.get("ratio", "1:1"))
+    prompt = build_edit_prompt(item, kind, len(paths), chars, text_mode, brand_hex, art, refs,
+                               (item.get("assets") or {}).get("content") or "")
+    base = edit_image(prompt, paths + [c["image_path"] for c in chars], out, item.get("ratio", "1:1"),
+                      allow_empty=mode == "generate")
     item["base_path"] = str(base)
     item["base_mode"] = text_mode
-    item.pop("fidelity", None)      # 新画面，旧的核对结果作废
+    item["base_key"] = asset_key(item, kind, lib)
     return compose_item(plan, kind, item)
+
+
+class NeedsPhoto(Exception):
+    """这屏的画面主体是真实的产品内容（原料、茶汤、叶底…），素材库里却没有对口的照片：先不出图，等商家补拍"""
+
+
+def render_job(plan: dict, kind: str, item: dict, product_paths: list[str], portraits: dict[str, dict],
+               text_mode: str, lib: list[dict], force: bool = False, check_fidelity: bool = False) -> str:
+    """
+    出一张图：底图能复用就只重排文字（"reused"），否则生成底图（"generated"）；check_fidelity 时新生成的主图再核对产品。
+    在线程池里跑：item 和 plan 都要是调用方给的副本，写回和存盘由调用方在一个线程里做
+    """
+    if not force and not needs_regen(item, text_mode, kind, lib):
+        compose_item(plan, kind, item)
+        return "reused"
+    render_item(plan, kind, item, product_paths, portraits, text_mode, lib)
+    if check_fidelity and kind == "main" and item.get("base_mode") != "photo":
+        check_product_fidelity(item, product_paths)
+    return "generated"
+
+
+def render_many(plan: dict, jobs: list[tuple[str, dict]], product_paths: list[str], portraits: dict[str, dict],
+                text_mode: str = DEFAULT_TEXT_MODE, library: list[dict] | None = None, force: bool = False,
+                check_fidelity: bool = False, workers: int = CONCURRENCY):
+    """
+    并行出图的生成器：同时跑 workers 张（各自提交任务、各自轮询），每完成一张就把结果写回 plan 里的那一项，
+    再 yield (kind, item, status, 说明)。完成顺序不一定是序号顺序。
+    status：generated / reused / needs_photo（缺实拍，没出图）/ service（接口故障）/ failed / skipped（没有尝试）。
+    线程里操作的是每张图的副本，plan 只在调用方的线程（这个生成器所在的线程）里改，存盘也由调用方做，
+    不会出现一边序列化 plan、一边有线程在改它。
+    同一时间只提交 workers 张，跑完一张再补一张：接口连续 2 张服务端故障时，后面的直接不再提交
+    """
+    lib = al.load_library() if library is None else library
+    view = {"meta": copy.deepcopy(plan.get("meta") or {})}       # 线程只读 meta（主题色、视觉设定）
+    workers = max(1, int(workers))
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ecom-draw")
+    todo, running, service_fails = list(jobs), {}, 0
+    try:
+        while todo or running:
+            while todo and len(running) < workers:
+                kind, it = todo.pop(0)
+                work = copy.deepcopy(it)
+                running[pool.submit(render_job, view, kind, work, product_paths, portraits, text_mode, lib, force,
+                                    check_fidelity)] = (kind, it, work)
+            done, _ = wait(running, return_when=FIRST_COMPLETED)
+            for fut in done:
+                kind, it, work = running.pop(fut)
+                try:
+                    status = fut.result()
+                except NeedsPhoto as e:
+                    yield kind, it, "needs_photo", str(e)
+                    continue
+                except ServiceError as e:
+                    service_fails += 1
+                    yield kind, it, "service", str(e)
+                    if service_fails >= 2:
+                        skipped, todo = todo, []
+                        for k, i in skipped:
+                            yield k, i, "skipped", ""
+                    continue
+                except Exception as e:
+                    print("".join(traceback.format_exception(e)))
+                    yield kind, it, "failed", str(e)[:300]
+                    continue
+                if status == "generated":
+                    service_fails = 0
+                it.clear()
+                it.update(work)
+                yield kind, it, status, ""
+    finally:
+        # 调用方中途放弃（页面断开）：后面的不再提交；已在跑的线程跑完就结束，结果不再写回
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _resolve_refs(item: dict, kind: str, lib: list[dict]):
+    """
+    这一屏实际用的素材：返回 (mode, 参考图条目列表或 None)。
+    None 表示没有素材分配（旧策划、素材库为空），沿用旧逻辑：调用方传入的包装图全当产品图。
+    分配的照片被删了就退一档：实拍直出 → 参考重绘 → 旧逻辑
+    """
+    if kind == "main" and item.get("white_bg"):
+        # 白底主图：素材库里有白底的包装正面就直接用（实物原图最可信），否则让 AI 抠白底
+        white = [e for e in al.package_refs(lib, 3)
+                 if e.get("type") == "package_front" and (e.get("quality") or {}).get("white_bg")]
+        return ("photo", white[:1]) if white else ("reference", None)
+    a = item.get("assets")
+    if not a:
+        return "reference", None
+    if kind == "main" and a.get("mode") == "photo":      # 主图不实拍直出（旧数据兜底）
+        a = {**a, "mode": "reference"}
+    if kind == "main" and a.get("mode") == "generate":   # 主图必须有产品：素材库没有能锁外观的照片时沿用旧逻辑
+        return "reference", None
+    if a.get("mode") == "generate":
+        return "generate", []
+    entries = [e for e in (al.find(lib, r) for r in a.get("refs") or []) if e]
+    if a.get("mode") == "photo":
+        content = al.find(lib, a.get("content") or "")
+        if content:
+            return "photo", [content]
+        entries = [e for e in entries if e.get("type") not in al.PHOTO_ONLY_TYPES]
+    return ("reference", entries) if entries else ("reference", None)
+
+
+def asset_key(item: dict, kind: str, lib: list[dict]) -> str:
+    """当前素材分配对应的底图 key；与 item["base_key"] 不同说明换过素材或出图方式，底图要重做"""
+    mode, refs = _resolve_refs(item, kind, lib)
+    return f"{mode}:{','.join(e['id'] for e in refs)}" if refs is not None else "legacy"
+
+
+def photo_base(item: dict, kind: str, photo_path: str, out_path: Path) -> Path:
+    """
+    实拍直出：不调生图接口。照片完整放进画面（不裁切，标签、证书上的字不会丢）。
+    详情页：照片放在文字区下方、圆角加阴影，背景是这张照片缩到极小再放大的柔和色块（与照片同色调）；
+    主图（白底图）：放在纯白画布中央，占约 80%
+    """
+    W, H = TARGET_SIZES[item.get("ratio", DETAIL_RATIO)]
+    src = ImageOps.exif_transpose(Image.open(photo_path)).convert("RGB")
+    if kind == "main":
+        canvas = Image.new("RGB", (W, H), "white")
+        img = ImageOps.contain(src, (int(W * 0.8), int(H * 0.8)), Image.LANCZOS)
+        canvas.paste(img, ((W - img.width) // 2, (H - img.height) // 2))
+    else:
+        bg = ImageOps.fit(src, (8, 10), Image.LANCZOS).resize((W, H), Image.BICUBIC)
+        canvas = Image.blend(bg, Image.new("RGB", (W, H), (246, 244, 240)), 0.55).convert("RGBA")
+        m = int(W * 0.06)
+        top = int(H * detail_share(item)) + m // 2
+        img = ImageOps.contain(src, (W - 2 * m, H - m - top), Image.LANCZOS)
+        x, y = (W - img.width) // 2, H - m - img.height
+        r, off = int(W * 0.025), int(W * 0.012)
+        shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        ImageDraw.Draw(shadow).rounded_rectangle((x, y + off, x + img.width, y + img.height + off), r,
+                                                 fill=(0, 0, 0, 70))
+        canvas = Image.alpha_composite(canvas, shadow.filter(ImageFilter.GaussianBlur(off * 1.5)))
+        mask = Image.new("L", img.size, 0)
+        ImageDraw.Draw(mask).rounded_rectangle((0, 0, img.width - 1, img.height - 1), r, fill=255)
+        canvas.paste(img, (x, y), mask)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.convert("RGB").save(out_path, format="PNG")
+    return out_path
 
 
 # ── 产品还原度核对（可选）：视觉模型对比实拍图和成品，看包装文字 / logo / 配色是否一致 ─────────
@@ -1164,6 +1596,10 @@ def _font_path(bold: bool) -> str:
         if p and os.path.exists(p):
             return p
     raise FileNotFoundError("未找到中文字体，请在 .env 中设置 ECOM_FONT / ECOM_FONT_BOLD 为 .ttf/.ttc 字体路径")
+
+
+# 字体对象按字号缓存、多线程共用；FreeType 不保证同一字体被多个线程同时使用是安全的，Pillow 排版时串行
+_PIL_TEXT_LOCK = threading.Lock()
 
 
 @lru_cache(maxsize=64)
@@ -1355,7 +1791,8 @@ def _compose(kind: str, item: dict, brand, out: Path) -> Path:
             print(f"[电商图] {reason}，改用 Pillow 简版排版（不支持角标、价格标签的样式和参数表的表格样式）")
             _fallback_noted = True
 
-    out = (_pil_compose_main if kind == "main" else _pil_compose_detail)(item, brand, out, img)
+    with _PIL_TEXT_LOCK:
+        out = (_pil_compose_main if kind == "main" else _pil_compose_detail)(item, brand, out, img)
     item["renderer"] = "pil"
     if reason:
         item["layout_warnings"] = [f"已退回简版排版：{reason}"]

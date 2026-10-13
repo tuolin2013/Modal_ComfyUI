@@ -18,6 +18,7 @@ import requests
 from pathlib import Path
 
 import category_playbook as cp
+import positioning as pos
 import quality_check as qc
 
 # 加载 pipeline/.env
@@ -450,6 +451,7 @@ def generate_storyboard(
     self_review: bool = False,
     custom_beats: str = "",
     concept_first: bool = False,
+    positioning: str = "",
 ) -> dict:
     """
     调用 right.codes LLM，生成带货分镜 JSON。
@@ -467,6 +469,7 @@ def generate_storyboard(
         self_review: 生成后按评分标准 + 程序检查结果让模型再改一轮（多一次 LLM 调用）
         custom_beats: 自定义节拍文本（每行「节拍名 | A-Roll/B-Roll | 任务」），story_template 为 CUSTOM_TEMPLATE 时使用
         concept_first: 先让模型出 3 个创意方向并选定一个，再按它展开分镜（多一次 LLM 调用）
+        positioning: 产品定位（positioning.POSITIONINGS 的键）；空或「跟随平台」时按平台默认（视频号 = 高端礼赠）
 
     Returns:
         分镜 JSON dict，含 meta（concept_first 时含 meta.concepts）/ product_refs / shots / quality_issues
@@ -487,14 +490,16 @@ def generate_storyboard(
     else:
         structure = f"剧情叙事节拍：{story_template}"
 
-    # 目标平台 → 画幅 + 时长 + 平台风格
+    # 目标平台 → 画幅 + 时长 + 平台风格；产品定位 → 节奏和语气
     plat = PLATFORMS.get(target_platform, PLATFORMS[DEFAULT_PLATFORM])
     lo, hi = platform_duration(target_platform)
+    position = pos.resolve(positioning, target_platform)
     platform_text = (
         f"目标平台：{target_platform}\n"
         f"画幅：{plat['aspect_ratio']}（所有构图描述和 image_gen_prompt 都按此画幅设计）\n"
         f"单镜时长：{lo:g}–{hi:g} 秒；每镜口播不超过 {voiceover_limit(target_platform)} 字\n"
-        f"平台要求：{plat['guide']}"
+        f"平台要求：{plat['guide']}\n"
+        + pos.prompt_block(position, "video")
     )
 
     # 产品图由剧本决定：LLM 列出需要哪些图；之后由 AI 以用户上传的实拍图为参考生成（或用户手动上传）
@@ -546,7 +551,13 @@ def generate_storyboard(
     beats = [b[0] for b in tpl["beats"]] if tpl else None
     check_kw = dict(beats=beats, vo_limit=voiceover_limit(target_platform), duration_range=(lo, hi),
                     playbook=playbook)
-    issues = qc.check_storyboard(storyboard, usp, **check_kw)
+
+    def check(sb):
+        # 商用标准包：口播里没有依据的说法（有机、野生、含量等）
+        vo = "\n".join(str(s.get("voiceover") or "") for s in sb.get("shots") or [])
+        return qc.check_storyboard(sb, usp, **check_kw) + qc.check_evidence(vo, product_context, playbook, "口播")
+
+    issues = check(storyboard)
 
     reviewed = False
     if self_review:
@@ -556,7 +567,7 @@ def generate_storyboard(
                 {"role": "user", "content": qc.revision_request(qc.VIDEO_RUBRIC, issues)},
             ], temperature=0.4)
             revised = _finalize(_parse_storyboard(*revised_raw), lo, hi)
-            new_issues = qc.check_storyboard(revised, usp, **check_kw)
+            new_issues = check(revised)
             # 按严重程度比较：改稿引入新的 ❌ 或总分变差（模型偶尔删镜头）就保留初稿
             if qc.accept_revision(issues, new_issues):
                 storyboard, issues, reviewed = revised, new_issues, True
@@ -570,6 +581,7 @@ def generate_storyboard(
         "aspect_ratio": plat["aspect_ratio"],
         "image_size": plat["image_size"],
         "playbook": playbook,
+        "positioning": position,
         "self_reviewed": reviewed,
         # 全片共用同一个随机种子，进一步统一画风
         "seed": random.randint(0, 2**31 - 1),

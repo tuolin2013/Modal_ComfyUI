@@ -16,7 +16,8 @@ PET = {"name": "猫静宝", "category": "宠物营养补充剂",
 
 # ── 类目手册 ──────────────────────────────────────────────────────────────────
 @pytest.mark.parametrize("brief, key", [
-    (PET, "pet"),                                                           # 宠物优先于保健
+    (PET, "pet_supplement"),                                                # 营养补充剂走商用标准包，优先于保健
+    ({"category": "宠物用品", "name": "猫砂 10L"}, "pet"),
     ({"category": "美妆护肤 · 精华"}, "beauty"),
     ({"category": "3C · 剃须刀"}, "digital"),
     ({"category": "", "name": "婴儿纸尿裤 L 码"}, "baby"),
@@ -96,7 +97,7 @@ def test_check_brief():
 def test_brief_reviews_and_playbook_reach_prompts():
     brief = {**PET, "reviews": "我家猫晚上一直叫", "playbook": cp.AUTO}
     text = brief_mod._input_text(brief)
-    assert "我家猫晚上一直叫" in text and "【类目手册：宠物用品" in text
+    assert "我家猫晚上一直叫" in text and "【类目手册：宠物营养补充剂" in text
     assert "买家原话" in brief_mod.brief_context(brief)
     assert set(brief_mod.INPUT_FIELDS) >= {"reviews", "playbook"}
 

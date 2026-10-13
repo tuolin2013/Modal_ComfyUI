@@ -23,7 +23,7 @@ BRIEF_PATH = Path(__file__).resolve().parent / "output" / "product_brief.json"
 
 # 页面字段：用户输入（reviews：买家评价/问大家/竞品卖点原文；playbook：类目手册，auto 为自动识别）
 INPUT_FIELDS = ("name", "category", "description", "audience", "price", "endorsements", "brand_color",
-                "reviews", "playbook")
+                "reviews", "playbook", "positioning")
 # 页面字段：LLM 分析结果（用户可改）
 ANALYSIS_FIELDS = ("usp", "pain_points", "differentiation", "persona", "scenes")
 
@@ -37,6 +37,7 @@ DEFAULT_BRIEF = {
     "brand_color": "#C8A882",
     "reviews": "",
     "playbook": cp.AUTO,
+    "positioning": "auto",      # positioning.FOLLOW_PLATFORM：按渠道默认（拼多多性价比，微信 / 视频号高端）
     "usp": "1000万分子玻尿酸\n3秒渗透不油腻",
     "pain_points": "",
     "differentiation": "",

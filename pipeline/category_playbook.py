@@ -21,6 +21,8 @@ import json
 import re
 from pathlib import Path
 
+import category_packs as packs
+
 AUTO = "auto"
 GENERAL = "general"
 CUSTOM_PREFIX = "custom:"
@@ -224,10 +226,39 @@ PLAYBOOKS: dict[str, dict] = {
 }
 
 # 自动识别的优先级：越专门的类目越靠前（「宠物营养补充剂」应归宠物而不是保健）
-DETECT_ORDER = ("pet", "baby", "health", "beauty", "food", "digital", "apparel", "home")
-BUILTIN_KEYS = DETECT_ORDER + (GENERAL,)
+BASE_DETECT_ORDER = ("pet", "baby", "health", "beauty", "food", "digital", "apparel", "home")
 # 自定义手册的字段（与内置手册一致）；字符串字段空着时沿用 parent
 TEXT_FIELDS = ("focus", "video", "ecom", "visual", "compliance_hint")
+# 商用标准包多出来的字段（见 category_packs）；自定义手册也可以写，空着时沿用 parent
+PACK_FIELDS = ("label_items", "label_basis", "photo_checklist", "evidence", "positioning_plans")
+
+
+def _inherit(parent: dict, child: dict) -> dict:
+    """子手册在 parent 之上：空着的文字字段沿用 parent；必填项、屏序覆盖、合规风险词只增不减。
+    标准包字段（标签必备项、照片清单等）子手册没写就沿用 parent；子手册自己改了屏序（detail_overrides）时，
+    不再沿用 parent 的整套定位屏序，免得改的屏被覆盖掉"""
+    pb = {**child, **{f: child.get(f) or parent.get(f, "") for f in TEXT_FIELDS}}
+    pb["required"] = list(parent["required"]) + [r for r in child.get("required") or []
+                                                 if r[0] not in {p[0] for p in parent["required"]}]
+    pb["detail_overrides"] = {**parent["detail_overrides"], **(child.get("detail_overrides") or {})}
+    # 只增不减：parent 的风险词是底线，子手册不能把它们删掉
+    pb["compliance"] = list(dict.fromkeys(list(parent["compliance"]) + list(child.get("compliance") or [])))
+    pb["label_basis"] = child.get("label_basis") or parent.get("label_basis") or ""
+    for f in ("label_items", "photo_checklist", "evidence"):
+        pb[f] = list(child.get(f) or parent.get(f) or [])
+    own_order = bool(child.get("detail_overrides"))
+    pb["positioning_plans"] = dict(child.get("positioning_plans") or
+                                   ({} if own_order else parent.get("positioning_plans") or {}))
+    return pb
+
+
+# 商用标准包注册为内置手册，排在各自 parent 前面识别
+for _key, _pack in packs.STANDARD_PACKS.items():
+    PLAYBOOKS[_key] = _inherit(PLAYBOOKS[_pack["parent"]], _pack)
+STANDARD_KEYS = tuple(packs.STANDARD_PACKS)
+DETECT_ORDER = tuple(k for base in BASE_DETECT_ORDER
+                     for k in [p for p, before in packs.DETECT_BEFORE.items() if before == base] + [base])
+BUILTIN_KEYS = DETECT_ORDER + (GENERAL,)
 
 
 # ── 自定义手册：读写 pipeline/playbooks/*.json ─────────────────────────────────
@@ -277,7 +308,36 @@ def normalize_custom(data: dict) -> dict:
            "detail_overrides": overrides, "compliance": compliance}
     for f in TEXT_FIELDS:
         out[f] = str(data.get(f) or "").strip()
+    out.update(_normalize_pack_fields(data))
     return out
+
+
+def _triples(value, n: int, regex_at: int | None = None) -> list[tuple]:
+    """[[a, b, c], ...] 或 [{...}] → 元组列表；长度不对、正则非法的项丢掉"""
+    out = []
+    for r in value if isinstance(value, list) else []:
+        if isinstance(r, dict):
+            r = tuple(r.values())
+        if isinstance(r, (list, tuple)) and len(r) == n and all(str(x).strip() for x in r[:2]):
+            if regex_at is not None and not _valid_regex(str(r[regex_at])):
+                continue
+            out.append(tuple(r))
+    return out
+
+
+def _normalize_pack_fields(data: dict) -> dict:
+    """自定义手册里的标准包字段（可选）：标签必备项、照片清单、需要依据的说法、各定位的完整屏序"""
+    label_items = [(str(a)[:12], str(b), str(c)[:60]) for a, b, c in _triples(data.get("label_items"), 3, 1)]
+    photos = [(str(a), str(b)[:40], bool(c)) for a, b, c in _triples(data.get("photo_checklist"), 3)]
+    evidence = [(str(a), str(b)[:60]) for a, b in _triples(data.get("evidence"), 2, 0)]
+    plans = {}
+    raw = data.get("positioning_plans")
+    for k, roles in (raw.items() if isinstance(raw, dict) else []):
+        roles = [str(r).strip()[:60] for r in roles if str(r).strip()] if isinstance(roles, list) else []
+        if len(roles) == 15:          # 详情页固定 15 屏，不够或多了的整套丢掉，退回通用定位屏序
+            plans[str(k)] = roles
+    return {"label_items": label_items, "photo_checklist": photos, "evidence": evidence,
+            "label_basis": str(data.get("label_basis") or "").strip()[:120], "positioning_plans": plans}
 
 
 def save_custom(data: dict) -> str:
@@ -315,17 +375,9 @@ def load_custom() -> dict[str, dict]:
 
 def _merged(custom: dict) -> dict:
     """自定义手册 + parent：空着的文字字段沿用 parent；合规词、必填项、屏序都在 parent 基础上叠加"""
-    parent = PLAYBOOKS[custom["parent"]]
-    pb = {f: custom[f] or parent[f] for f in TEXT_FIELDS}
-    pb.update(
-        label=custom["label"], parent=custom["parent"],
-        keywords="|".join(re.escape(k) for k in custom["keywords"]),
-        required=list(parent["required"]) + [r for r in custom["required"]
-                                             if r[0] not in {p[0] for p in parent["required"]}],
-        detail_overrides={**parent["detail_overrides"], **custom["detail_overrides"]},
-        # 只增不减：parent 的风险词是底线，自定义手册不能把它们删掉
-        compliance=list(dict.fromkeys(parent["compliance"] + custom["compliance"])),
-    )
+    pb = _inherit(PLAYBOOKS[custom["parent"]], custom)
+    pb.update(label=custom["label"], parent=custom["parent"],
+              keywords="|".join(re.escape(k) for k in custom["keywords"]))
     return pb
 
 
@@ -436,6 +488,27 @@ def detail_roles(base: list[str], key: str | None) -> list[str]:
     return [overrides.get(i, role) for i, role in enumerate(base, 1)]
 
 
+def is_standard(key: str | None) -> bool:
+    """商用标准包（或以它为 parent 的自定义手册）"""
+    return bool(get(key).get("label_items"))
+
+
+def missing_label_items(text: str, key: str | None) -> list[tuple[str, str]]:
+    """包装标签必备项里，在 text（产品描述 + 背书 + 包装背面识别出的标签）中找不到的：[(名称, 提示)]"""
+    return [(name, tip) for name, pattern, tip in get(key).get("label_items") or []
+            if not re.search(pattern, text or "", flags=re.I)]
+
+
+def unsupported_claims(copy: str, source: str, key: str | None) -> list[tuple[str, str]]:
+    """文案里出现、但产品信息里没有依据的说法：[(命中的词, 提示)]。只是提醒，不判违规"""
+    out = []
+    for pattern, tip in get(key).get("evidence") or []:
+        hit = re.search(pattern, copy or "", flags=re.I)
+        if hit and not re.search(pattern, source or "", flags=re.I):
+            out.append((hit.group(), tip))
+    return out
+
+
 def missing_required(brief: dict, key: str | None) -> list[tuple[str, str]]:
     """类目必填信息里，用户输入中找不到的项：[(名称, 提示)]"""
     text = " ".join(str(brief.get(k) or "") for k in ("name", "category", "description", "endorsements", "price"))
@@ -459,4 +532,9 @@ def prompt_block(key: str | None, purpose: str) -> str:
         lines.append(f"画面方向（英文提示词可参考）：{pb['visual']}")
     if pb["compliance_hint"]:
         lines.append(f"类目合规：{pb['compliance_hint']}")
+    if pb.get("evidence"):
+        lines.append("这些说法只有产品信息里写明了依据才能用：" + "；".join(tip for _, tip in pb["evidence"]))
+    if purpose == "ecom" and pb.get("label_items"):
+        lines.append(f"规格参数屏按标签必备项列（{pb['label_basis']}），产品信息里没有的写【占位】，不要编："
+                     + "、".join(n for n, _, _ in pb["label_items"]))
     return "\n".join(lines)

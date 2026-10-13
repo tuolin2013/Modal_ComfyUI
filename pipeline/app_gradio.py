@@ -32,6 +32,8 @@ from layer1_planning import (
 from layer2_visual_assets import generate_all_shots, quick_draft, generate_character_portrait
 from layer3_h3_prompt import process_all_prompts
 import category_playbook as cp
+import asset_library as al
+import positioning as pos
 import ecom_images as ecom
 import product_brief as brief_mod
 import quality_check as qc
@@ -326,6 +328,7 @@ def collect_brief(values, save: bool = True) -> dict:
     """按 BRIEF_FIELDS 顺序把页面输入组装成 dict，并保存（刷新页面后恢复）"""
     brief = {k: (str(v).strip() if v is not None else "") for k, v in zip(BRIEF_FIELDS, values)}
     brief["playbook"] = brief.get("playbook") or cp.AUTO
+    brief["positioning"] = brief.get("positioning") or pos.FOLLOW_PLATFORM
     if save:
         brief_mod.save_brief(brief)
     return brief
@@ -333,7 +336,11 @@ def collect_brief(values, save: bool = True) -> dict:
 
 def brief_check_report(brief: dict) -> str:
     key = cp.resolve(brief)
-    return f"\n📚 类目手册：{cp.label(key)}" + qc.format_report("输入体检", qc.check_brief(brief, key))
+    lib = al.load_library()
+    label_text = al.label_context(lib)
+    photo_types = {e.get("type") for e in lib}
+    return f"\n📚 类目手册：{cp.label(key)}" + qc.format_report(
+        "输入体检", qc.check_brief(brief, key, photo_types, label_text))
 
 
 def run_brief_check(*values):
@@ -405,6 +412,7 @@ def run_layer1(story_template, platform, agent_skills, include_skill_refs, self_
             playbook=playbook,
             self_review=bool(self_review),
             concept_first=bool(concept_first),
+            positioning=brief.get("positioning") or pos.FOLLOW_PLATFORM,
         )
         save_storyboard(storyboard, STORYBOARD_PATH)
     except Exception as e:
@@ -430,7 +438,7 @@ def run_layer1(story_template, platform, agent_skills, include_skill_refs, self_
     else:
         msg += "\n💡 本剧本没有真实产品入画的镜头，无需产品图。"
     # 硬校验（含口播的广告法 / 类目合规初筛）；自检开启时这是改过一轮之后的结果
-    msg += f"\n📚 类目手册：{cp.label(playbook)}"
+    msg += f"\n📚 类目手册：{cp.label(playbook)} · 定位：{pos.label((storyboard.get('meta') or {}).get('positioning'))}"
     if (storyboard.get("meta") or {}).get("self_reviewed"):
         msg += " · 已按评分标准自检修改一轮"
     elif self_review:
@@ -864,25 +872,77 @@ def ecom_portraits() -> dict[str, dict]:
 
 
 def ecom_product_note() -> str:
-    """说明当前生图实际用哪些产品图（本页没传时沿用视频页的）"""
-    if ecom.get_product_images():
-        return (f"已上传 {len(ecom.get_product_images())} 张（图 1 为主参考）。"
-                "换图后，视频里已生成的产品图不会自动更新，可在「② 素材准备」点重新生成。")
+    """说明当前素材库的情况（本页没传时沿用视频页的产品图）"""
+    lib = al.load_library()
+    if lib:
+        pkg = al.package_refs(lib, ecom.MAX_PRODUCT_REFS)
+        has_front = any(e.get("type") == "package_front" for e in lib)
+        pending = sum(e.get("type_source") == "pending" for e in lib)
+        msg = (f"素材库 {len(lib)} 张；锁定产品外观用：{'、'.join(e['id'] for e in pkg) or '无'}。"
+               "主图 / 详情页策划时按类型自动给每屏分配素材。")
+        if pending:
+            msg += f"\n⏳ {pending} 张还没识别类型，点「🤖 自动识别类型」或手动选。"
+        if not has_front:
+            msg += "\n⚠️ 没有标为「包装正面」的照片，AI 画面里的产品外观可能不准。"
+        return msg
     fallback = ecom_product_images()
     if fallback:
-        return f"「📦 产品信息」页未上传，主图/详情页沿用当前剧本里的 {len(fallback)} 张产品图。"
-    return "⚠️ 还没有产品图，请至少上传 1 张，再生成剧本。"
+        return f"素材库为空，主图/详情页沿用当前剧本里的 {len(fallback)} 张产品图。"
+    return "⚠️ 还没有产品图。建议至少上传：包装正面、包装背面（配料 / 标签），以及产品本体、使用中的实拍。"
 
 
-def ecom_set_product(slot: int, file_path):
-    """上传 / 替换 / 删除第 slot 个产品图位"""
+def ecom_add_photos(files, auto_tag: bool):
+    """上传多张照片进素材库；auto_tag 时立即用视觉模型识别类型（每 6 张一次调用）"""
     try:
-        saved = ecom.set_product_image(slot, file_path)
-        msg = (f"✅ 产品图 {slot} 已保存" if saved else f"🗑️ 产品图 {slot} 已删除") + \
-              "。已生成的图不受影响，需要时点「重新生成画面」。"
-        return msg, ecom_product_note()
+        paths = [f if isinstance(f, str) else getattr(f, "name", "") for f in (files or [])]
+        added, skipped = al.add_photos([p for p in paths if p])
+        msg = f"📥 新增 {len(added)} 张" + (f"；跳过 {len(skipped)} 张：" + "；".join(skipped) if skipped else "")
+        if added and auto_tag:
+            done, errors = ecom.classify_photos(added)
+            msg += f"\n🤖 已识别 {done} 张类型，请在缩略图下核对，分错的直接改。"
+            if errors:
+                msg += "\n⚠️ " + "\n⚠️ ".join(errors) + "\n未识别的请手动选类型（视觉模型由 ECOM_CHECK_MODEL 指定）。"
+        return msg, al.load_library(), None, ecom_product_note()
     except Exception as e:
-        return err(e), ecom_product_note()
+        return err(e), al.load_library(), None, ecom_product_note()
+
+
+def ecom_tag_photos(force: bool = False):
+    """识别还没有类型的照片；force 时除了手动改过的，全部重新识别"""
+    try:
+        todo = al.needs_tagging(al.load_library(), force)
+        if not todo:
+            return "✅ 没有需要识别的照片（手动改过类型的不会被覆盖）", al.load_library(), ecom_product_note()
+        done, errors = ecom.classify_photos(todo)
+        msg = f"🤖 已识别 {done}/{len(todo)} 张。" + ("\n⚠️ " + "\n⚠️ ".join(errors) if errors else "")
+        return msg, al.load_library(), ecom_product_note()
+    except Exception as e:
+        return err(e), al.load_library(), ecom_product_note()
+
+
+def ecom_set_photo_type(pid: str, kind: str):
+    al.update_photo(pid, type=kind)
+    return f"✅ {pid} 已设为「{al.type_label(kind)}」（手动设置，重新识别时不会覆盖）。已策划的详情页点「🔁 重新分配素材」生效", \
+        al.load_library(), ecom_product_note()
+
+
+def ecom_set_photo_note(pid: str, note: str):
+    al.update_photo(pid, note=note)
+
+
+def ecom_set_label_fields(pid: str, text: str):
+    """包装背面的标签信息：每行「名称：值」"""
+    fields = {}
+    for line in (text or "").splitlines():
+        k, sep, v = line.partition("：") if "：" in line else line.partition(":")
+        if sep:
+            fields[k.strip()] = v.strip()
+    al.update_photo(pid, label_fields=fields)
+
+
+def ecom_remove_photo(pid: str):
+    al.remove_photo(pid)
+    return f"🗑️ {pid} 已从素材库删除。用到它的详情页点「🔁 重新分配素材」换图", al.load_library(), ecom_product_note()
 
 
 def _plan_issue_summary(plan: dict) -> str:
@@ -909,14 +969,15 @@ def ecom_plan(platform, use_chars, main_count, main_ratio, self_review, *brief_v
         plan = ecom.generate_ecom_plan(brief["name"], usp, brief["brand_color"], platform, chars,
                                        main_count=int(main_count), main_ratio=main_ratio,
                                        product_context=brief_mod.brief_context(brief),
-                                       playbook=playbook, self_review=bool(self_review))
+                                       playbook=playbook, self_review=bool(self_review),
+                                       positioning=brief.get("positioning") or pos.FOLLOW_PLATFORM)
         ecom.reset_outputs()
         ecom.save_plan(plan)
         reviewed = " · 已按评分标准自检修改一轮" if plan["meta"].get("self_reviewed") else \
             (" · 自检后问题没有减少，保留初稿" if self_review else "")
         msg = (f"✅ 已策划 {len(plan['main_images'])} 张 {main_ratio} 主图 + "
                f"{len(plan['detail_sections'])} 张 3:4 详情页（{platform}）。"
-               f"\n📚 类目手册：{cp.label(playbook)}{reviewed}"
+               f"\n📚 类目手册：{cp.label(playbook)} · 定位：{pos.label(plan['meta']['positioning'])}{reviewed}"
                f"\n请在右侧核对、修改文案，再点「生成全部图片」。"
                + qc.format_report("图文检查", plan.get("quality_issues") or []) + _plan_issue_summary(plan))
         return msg, plan
@@ -931,9 +992,11 @@ def _ecom_items(plan: dict):
 
 def ecom_generate_all(force=False, text_mode=ecom.DEFAULT_TEXT_MODE, check_fidelity=False, progress=gr.Progress()):
     """
-    逐张生成（串行）。底图可复用的只重排文字、不再调用接口；失败后再点一次只补失败的。
+    并行生成：同时出 ecom.CONCURRENCY 张（各自提交任务、各自轮询，见 ecom.render_many）。
+    底图可复用的只重排文字、不再调用接口；失败后再点一次只补失败的。
+    素材库在策划之后变过（补拍、删图、改类型）时先自动重新分配素材，手动指定过的屏不动。
     切换写字方式后，有文字的图会重新生成（底图里有没有字不同），白底图等无字图照常复用。
-    生成器：每完成一张就把最新 plan 推给页面，右侧卡片逐张显示，不用等整套跑完。
+    生成器：每完成一张就存盘，并把最新 plan 推给页面，卡片按完成顺序逐张显示，不用等整套跑完。
     check_fidelity：新生成的主图用视觉模型对比实拍图，核对包装文字 / logo / 配色（每张多一次调用）
     """
     plan = ecom.load_plan()
@@ -944,44 +1007,44 @@ def ecom_generate_all(force=False, text_mode=ecom.DEFAULT_TEXT_MODE, check_fidel
     if not products:
         yield "⚠️ 请先在「📦 产品信息」页上传产品实拍图", gr.skip()
         return
-    portraits = ecom_portraits()
+    lib = al.load_library()
+    head = ""
+    synced = ecom.sync_assets(plan, lib)
+    if synced is not None:
+        ecom.save_plan(plan)
+        if synced["changed"]:
+            head = f"🔁 素材库在策划后有变化，已重新分配素材（手动指定的不动）：{'、'.join(synced['changed'])}\n"
 
     items = _ecom_items(plan)
-    failed, generated, reused = [], 0, 0
-    service_fails, aborted = 0, ""  # 连续服务端故障计数
-    for i, (kind, it) in enumerate(items):
-        progress(i / len(items), desc=f"{it['id']} {it['role'][:12]}")
-        if i:
-            # 推送上一张的结果：plan 每张都已写盘，传重新读出的新对象，确保页面检测到变化并重绘
-            yield (f"⏳ 进行中 {i}/{len(items)}：新生成 {generated}，复用 {reused}，失败 {len(failed)}",
-                   ecom.load_plan())
-        try:
-            if not force and not ecom.needs_regen(it, text_mode):
-                ecom.compose_item(plan, kind, it)
-                reused += 1
-            else:
-                ecom.render_item(plan, kind, it, products, portraits, text_mode)
-                generated += 1
-                service_fails = 0
-                if check_fidelity and kind == "main":
-                    ecom.check_product_fidelity(it, products)
-        except ecom.ServiceError as e:
-            print(f"[电商图] {it['id']} 失败：{e}")
-            failed.append(f"{it['id']}：{e}")
-            service_fails += 1
-            if service_fails >= 2:
-                # 接口连续两张都是 5xx / 连不上，后面的图大概率也会失败，停下来省时间
-                aborted = (f"\n\n⛔ 图像接口连续 {service_fails} 张服务端故障，已暂停，剩余 "
-                           f"{len(items) - i - 1} 张未尝试。这是中转平台/上游的问题（不是提示词或图片的问题），"
-                           "稍后再点「生成全部图片」会从失败处继续。")
-                ecom.save_plan(plan)
-                break
-        except Exception as e:
-            print(traceback.format_exc())
-            failed.append(f"{it['id']}：{str(e)[:300]}")
+    total, done = len(items), 0
+    generated, reused, failed, waiting, skipped = 0, 0, [], [], []
+    progress(0, desc=f"同时出 {ecom.CONCURRENCY} 张")
+    yield head + f"⏳ 开始生成 {total} 张（同时 {ecom.CONCURRENCY} 张，先完成的先显示）", ecom.load_plan()
+    for kind, it, status, info in ecom.render_many(plan, items, products, ecom_portraits(), text_mode, lib,
+                                                    force=bool(force), check_fidelity=bool(check_fidelity)):
+        done += 1
+        if status == "generated":
+            generated += 1
+        elif status == "reused":
+            reused += 1
+        elif status == "needs_photo":
+            waiting.append(f"{it['id']}：{info}")
+        elif status == "skipped":
+            skipped.append(it["id"])
+            continue
+        else:
+            print(f"[电商图] {it['id']} 失败：{info}")
+            failed.append(f"{it['id']}：{info}")
         ecom.save_plan(plan)  # 每张写回，中途失败不丢已生成的
+        progress(done / total, desc=f"{it['id']} {it['role'][:12]}")
+        # 传重新读出的新对象，确保页面检测到变化并重绘
+        yield (head + f"⏳ 已完成 {done}/{total}：新生成 {generated}，复用 {reused}，失败 {len(failed)}"
+               + (f"，缺实拍 {len(waiting)}" if waiting else "")), ecom.load_plan()
 
-    msg = f"共 {len(items)} 张：新生成 {generated} 张，复用底图重排 {reused} 张。" + aborted
+    msg = f"共 {total} 张：新生成 {generated} 张，复用底图重排 {reused} 张。"
+    if skipped:
+        msg += (f"\n\n⛔ 图像接口连续 2 张服务端故障，已停止，{len(skipped)} 张未尝试（{'、'.join(skipped)}）。"
+                "这是中转平台/上游的问题（不是提示词或图片的问题），稍后再点「生成全部图片」会从失败处继续。")
     check = "上架前请逐张核对产品包装文字/logo 是否与实物一致"
     if text_mode == "ai":
         check += "，并逐字核对 AI 写的中文（错字请改文案后点「重新生成画面」，或切换为程序叠字）"
@@ -991,20 +1054,26 @@ def ecom_generate_all(force=False, text_mode=ecom.DEFAULT_TEXT_MODE, check_fidel
     fidelity = [f"  {it['id']}：{ecom.fidelity_note(it)}" for _, it in items if ecom.fidelity_note(it)]
     if fidelity:
         check += "\n" + "\n".join(fidelity)
+    if waiting:
+        msg += (f"\n\n📷 {len(waiting)} 屏缺实拍照片，没有出图：\n" + "\n".join(waiting)
+                + "\n在这几张卡片上点「📷 上传这屏的参考照片」，再点一次「生成全部图片」只补这几屏。")
     if failed:
         msg = f"❌ {len(failed)} 张失败：\n" + "\n".join(failed) + "\n\n" + msg + "\n再点一次「生成全部图片」只补失败的。"
     else:
-        msg = "✅ " + msg + f"\n{check}。"
-    yield msg + _plan_issue_summary(plan), ecom.load_plan()
+        msg = ("✅ " if not (waiting or skipped) else "") + msg + f"\n{check}。"
+    yield head + msg + _plan_issue_summary(plan), ecom.load_plan()
 
 
 def ecom_save_item(kind, item_id, regen, headline, subline, badges, scene, text_mode=ecom.DEFAULT_TEXT_MODE,
-                   tag="", price_label="", price="", specs="", layout="standard", compare=""):
+                   tag="", price_label="", price="", specs="", layout="standard", compare="",
+                   asset_content=None, asset_mode=None, shot=None):
     """
     保存某张图的文案。regen=False：程序叠字的图只重排文字（免费）；AI 写字的图文字在画面里，只保存文案。
     regen=True：按当前写字方式重新生成画面。
     tag：主图左上角角标 / 详情页标题上方小标签；price_label + price：主图价格标签；specs：详情页参数表（每行「名称：值」）
     layout：详情页版式（standard / steps / grid / compare）；compare：对比表文本（首行「左列名｜右列名」，之后「项｜左｜右」）
+    asset_content / asset_mode / shot：详情页素材（照片 id，"" = 不用）、出图方式（"" = 自动）、拍法；
+    None 表示界面没有这几个控件（不改）。和原来不同时记为手动指定，并在下次生成时重出底图
     """
     try:
         plan = ecom.load_plan()
@@ -1030,13 +1099,30 @@ def ecom_save_item(kind, item_id, regen, headline, subline, badges, scene, text_
             if ecom.detail_share(it) > old_share and _ready(it.get("base_path")) and not regen:
                 layout_note += "\n💡 信息图需要更大的顶部留白，建议点「重新生成画面」，否则文字可能压到产品"
         it["scene_prompt_en"] = (scene or "").strip()
+        lib = al.load_library()
+        if asset_content is not None and not it.get("white_bg"):
+            old = it.get("assets") or {}
+            content, mode = (asset_content or ""), (asset_mode or "")
+            if content != (old.get("content") or "") or mode != (old.get("mode") if old.get("source") == "user" else "") \
+                    or (kind == "detail" and shot and shot != it.get("shot")):
+                ecom.set_item_asset(it, lib, content, mode, shot or "", main=kind == "main")
+                layout_note += f"\n🖼 素材已改为：{al.asset_note(it['assets'], lib)}"
+                if it["assets"]["mode"] != "photo" and not regen:
+                    layout_note += "\n💡 换了素材或拍法，点「重新生成画面」后生效"
 
-        if regen:
+        # 实拍直出是本地合成、不花钱：换成实拍直出时直接重出底图；AI 画面只在点「重新生成画面」时重画
+        free_redo = kind == "detail" and (it.get("assets") or {}).get("mode") == "photo" \
+            and ecom.needs_regen(it, text_mode, kind, lib)
+        if regen or free_redo:
             products = ecom_product_images()
-            if not products:
+            if not products and not lib:
                 return "⚠️ 请先上传产品图", plan
-            ecom.render_item(plan, kind, it, products, ecom_portraits(), text_mode)
-            msg = f"✅ {item_id} 已重新生成（{ecom.TEXT_MODES[it['base_mode']]}）"
+            try:
+                ecom.render_item(plan, kind, it, products, ecom_portraits(), text_mode, lib)
+            except ecom.NeedsPhoto as e:
+                ecom.save_plan(plan)    # 文案照常保存，只是这屏先不出图
+                return f"📷 {item_id} 文案已保存。{e}" + layout_note, plan
+            msg = f"✅ {item_id} 已重新生成（{al.MODES.get(it['base_mode']) or ecom.TEXT_MODES.get(it['base_mode'], '')}）"
         elif _ready(it.get("base_path")) and it.get("base_mode") == "ai" and ecom.has_text(it):
             msg = f"✅ {item_id} 文案已保存。这张图的文字是 AI 画在画面里的，点「重新生成画面」后才会更新"
         elif _ready(it.get("base_path")):
@@ -1055,6 +1141,36 @@ def ecom_save_item(kind, item_id, regen, headline, subline, badges, scene, text_
         return err(e), gr.skip()
 
 
+def ecom_item_upload(kind, item_id, file):
+    """
+    卡片上给这一屏上传参考照片：放进素材库，类型按这屏要的记（算手动设置，不等识别），并指定为这屏的素材
+    （手动指定，重新分配素材时保持不变）。同一张照片已经在素材库里就直接用那一张
+    """
+    try:
+        plan = ecom.load_plan()
+        it = ecom.find_item(plan, kind, item_id)
+        path = file if isinstance(file, str) else getattr(file, "name", "")
+        if not it or not path:
+            return "⚠️ 找不到这张图，或没收到照片", gr.skip(), gr.skip(), gr.skip()
+        added, skipped = al.add_photos([path])
+        lib = al.load_library()
+        entry = added[0] if added else al.find_same(lib, path)
+        if not entry:
+            return "⚠️ " + "；".join(skipped), gr.skip(), gr.skip(), gr.skip()
+        if added:
+            need = al.role_need(it.get("role", ""), kind == "main")
+            al.update_photo(entry["id"], type=(it.get("assets") or {}).get("missing") or need["types"][0])
+            lib = al.load_library()
+        a = ecom.set_item_asset(it, lib, entry["id"], "", "", main=kind == "main")
+        ecom.save_plan(plan)
+        e = al.find(lib, entry["id"])
+        msg = (f"📥 {item_id} 的参考照片：{al.describe(e)}（类型不对就到「③ 产品素材库」改）\n"
+               f"{al.asset_note(a, lib)}\n点「🔄 重新生成画面」或「生成全部图片」后生效。")
+        return msg, plan, lib, ecom_product_note()
+    except Exception as ex:
+        return err(ex), gr.skip(), gr.skip(), gr.skip()
+
+
 def ecom_export():
     """打包成品。zip 以「商品名_时间」命名存进 exports/，清空后也不会丢"""
     final = ecom.FINAL_DIR
@@ -1070,28 +1186,77 @@ def ecom_export():
             "\n做下一个产品前，点「🧹 清空，开始新产品」。"), archive
 
 
+def ecom_reassign():
+    """素材库变了之后重新给详情页分配素材和拍法（文案不动，手动指定过的屏保持不变）"""
+    try:
+        plan = ecom.load_plan()
+        if not plan.get("detail_sections"):
+            return "⚠️ 请先点「策划图文」", gr.skip()
+        lib = al.load_library()
+        res = ecom.reassign_assets(plan, lib)
+        ecom.save_plan(plan)
+        msg = (f"🔁 已重新分配素材：{len(res['changed'])} 屏有变化（{'、'.join(res['changed']) or '无'}），"
+               "下次「生成全部图片」时只重出这几屏的底图。")
+        return msg + qc.format_report("素材检查", res["issues"]), plan
+    except Exception as e:
+        return err(e), gr.skip()
+
+
 def ecom_clear():
-    """清空本页的策划、底图、成品和产品图（「📦 产品信息」页的文字不动，已打包的 zip 保留）"""
+    """清空本页的策划、底图、成品和素材库（「📦 产品信息」页的文字不动，已打包的 zip 保留）"""
     try:
         ecom.clear_all()
-        n = ecom.MAX_PRODUCT_REFS
-        return ("🧹 已清空主图/详情页的策划、底图、成品和产品实拍图（已打包的 zip 保留在 exports/；"
+        return ("🧹 已清空主图/详情页的策划、底图、成品和产品素材库（已打包的 zip 保留在 exports/；"
                 "已生成的视频剧本自带一份产品图，不受影响）。"
-                "\n请在「📦 产品信息」页改成新产品的信息，上传新产品图后重新策划。"), {}, None, ecom_product_note(), \
-            *([None] * n), *([""] * n)
+                "\n请在「📦 产品信息」页改成新产品的信息，上传新产品图后重新策划。"), {}, None, ecom_product_note(), []
     except Exception as e:
-        return (err(e), gr.skip(), gr.skip(), gr.skip(), *([gr.skip()] * (ecom.MAX_PRODUCT_REFS * 2)))
+        return err(e), gr.skip(), gr.skip(), gr.skip(), gr.skip()
 
 
-def render_ecom_card(kind: str, it: dict, playbook: str | None = None):
-    """在 @gr.render 上下文中绘制单张主图/详情页卡片"""
+def render_photo_card(e: dict):
+    """在 @gr.render 上下文中绘制素材库里的一张照片：缩略图、类型（可改）、备注、包装背面的标签信息、删除"""
+    with gr.Column(min_width=150, elem_classes="asset-card"):
+        q = e.get("quality") or {}
+        src = {"pending": "待识别", "auto": "自动识别", "user": "手动", "legacy": "旧图位"}.get(e.get("type_source"), "")
+        gr.Image(value=e["path"], label=f"{e['id']} · {src}", interactive=False, height=150, show_label=True)
+        kind = gr.Dropdown(choices=al.type_choices(), value=e.get("type", al.DEFAULT_TYPE), show_label=False,
+                           interactive=True)
+        note = gr.Textbox(value=e.get("note", ""), placeholder="内容说明（选填）", show_label=False,
+                          max_lines=1, interactive=True)
+        gr.Markdown(al.quality_note(q), elem_classes="hint")
+        if e.get("type") == "package_back":
+            fields = "\n".join(f"{k}：{v}" for k, v in (e.get("label_fields") or {}).items())
+            labels = gr.Textbox(value=fields, lines=3, interactive=True,
+                                label="标签信息（自动读取，请核对；每行「名称：值」）")
+            labels.blur(fn=lambda t, p=e["id"]: ecom_set_label_fields(p, t), inputs=[labels], outputs=[])
+        btn_del = gr.Button("🗑️ 删除", size="sm")
+    pid = e["id"]
+    kind.input(fn=lambda k, p=pid: ecom_set_photo_type(p, k), inputs=[kind],
+               outputs=[status_text, photo_state, ecom_product_md])
+    note.blur(fn=lambda t, p=pid: ecom_set_photo_note(p, t), inputs=[note], outputs=[])
+    btn_del.click(fn=lambda p=pid: ecom_remove_photo(p), inputs=[],
+                  outputs=[status_text, photo_state, ecom_product_md])
+
+
+def render_ecom_card(kind: str, it: dict, playbook: str | None = None, lib: list[dict] | None = None,
+                     stamp: str = ""):
+    """
+    在 @gr.render 上下文中绘制单张主图/详情页卡片；lib：素材库（卡片显示和修改这一屏用哪张素材）。
+    stamp：策划时间。输入框按「策划时间 + 编号」设 key：生成时每完成一张页面都会重绘，
+    有 key 的框重绘后保留用户还没保存的编辑；重新策划后 key 变了，才换成新文案
+    """
     is_main = kind == "main"
+    lib = lib or []
+    iid = it["id"]
+
+    def key(name):
+        return f"ecom-{stamp}-{iid}-{name}"
     issues = ecom.item_issues(it, playbook)
     final = it.get("final_path") if _ready(it.get("final_path")) else None
     with gr.Group(elem_classes="asset-card"), gr.Row():
         with gr.Column(scale=1, min_width=200):
             gr.Image(value=final, label=f"{it['id']} 成品" if final else f"{it['id']}（未生成）",
-                     interactive=False, height=320)
+                     interactive=False, height=320, key=key("img"), preserved_by_key=None)
         with gr.Column(scale=2):
             people = "、".join(it.get("use_characters") or [])
             chips = [ui.chip("已生成", "ok") if final else ui.chip("待生成")]
@@ -1104,12 +1269,18 @@ def render_ecom_card(kind: str, it: dict, playbook: str | None = None):
                 chips.append(ui.chip("白底图 · 不加文字"))
             if people:
                 chips.append(ui.chip(f"出镜：{people}"))
+            if it.get("shot"):
+                chips.append(ui.chip(f"📷 {al.shot_label(it['shot'])}"))
+            if (it.get("assets") or {}).get("needs_photo"):
+                chips.append(ui.chip("缺实拍 · 上传后才出图", "warn"))
             layout = it.get("layout_warnings") or []
             fidelity = ecom.fidelity_note(it)
             warnings = ([f"⚠️ {'、'.join(issues)}"] if issues else []) + \
                        ([f"📐 排版提示：{'；'.join(layout)}"] if layout else []) + \
                        ([fidelity] if fidelity else [])
-            gr.HTML(ui.card_head(it["id"], it["role"], chips, warnings))
+            notes = [al.asset_note(it.get("assets"), lib)] if it.get("assets") else []
+            gr.HTML(ui.card_head(it["id"], it["role"], chips, warnings, notes=notes), key=key("head"),
+                    preserved_by_key=None)
             if it.get("white_bg"):
                 head = gr.Textbox(value="", visible=False)
                 sub = gr.Textbox(value="", visible=False)
@@ -1124,41 +1295,79 @@ def render_ecom_card(kind: str, it: dict, playbook: str | None = None):
                 # gr.render 里新建的组件必须显式 interactive=True：否则前端会把「有默认值」的框当成只读展示
                 # （策划后主标题/副标题/卖点有值就改不了，留空的角标/价格反而能改）
                 head = gr.Textbox(label="主标题" if is_main else "标题",
-                                  value=it.get("headline" if is_main else "title", ""), interactive=True)
+                                  value=it.get("headline" if is_main else "title", ""), interactive=True, key=key("title"))
                 sub = gr.Textbox(label="副标题" if is_main else "正文", interactive=True,
-                                 value=it.get("subline" if is_main else "body", ""), lines=1 if is_main else 2)
+                                 value=it.get("subline" if is_main else "body", ""), lines=1 if is_main else 2, key=key("sub"))
                 badges = gr.Textbox(label="卖点标签（每行一个，最多 3 个）" if is_main
                                     else "要点（每行一条，最多 4 条；步骤用 ①②③ 开头）", interactive=True,
-                                    value="\n".join(it.get("badges" if is_main else "bullets", [])), lines=2)
+                                    value="\n".join(it.get("badges" if is_main else "bullets", [])), lines=2, key=key("badges"))
                 with gr.Row():
                     tag = gr.Textbox(label="左上角角标（选填）" if is_main else "标题上方小标签（选填）",
-                                     value=it.get("tag", ""), max_lines=1, interactive=True)
+                                     value=it.get("tag", ""), max_lines=1, interactive=True, key=key("tag"))
                     price_label = gr.Textbox(label="价格说明（如 券后价）", value=it.get("price_label", ""),
-                                             max_lines=1, visible=is_main, interactive=True)
+                                             max_lines=1, visible=is_main, interactive=True, key=key("price_label"))
                     price = gr.Textbox(label="价格（数字，不带 ¥；留空则不显示）", value=it.get("price", ""),
-                                       max_lines=1, visible=is_main, interactive=True)
+                                       max_lines=1, visible=is_main, interactive=True, key=key("price"))
                 specs = gr.Textbox(label="参数表（选填，每行「名称：值」，最多 6 行）", interactive=True,
-                                   value=ecom.specs_text(it.get("specs")), lines=3, visible=not is_main)
+                                   value=ecom.specs_text(it.get("specs")), lines=3, visible=not is_main, key=key("specs"))
                 with gr.Row(visible=not is_main):
                     layout = gr.Dropdown(label="版式（信息图由程序排版，文字准确）", choices=ecom.layout_choices(),
-                                         value=it.get("layout") or "standard", interactive=True)
+                                         value=it.get("layout") or "standard", interactive=True, key=key("layout"))
                     compare = gr.Textbox(label="对比表（版式选对比表时用）", interactive=True, lines=3,
                                          value=ecom.compare_text(it.get("compare")),
-                                         placeholder="普通做法｜本品\n冲泡｜要洗茶｜开水直接冲\n口感｜偏苦涩｜回味甘甜")
+                                         placeholder="普通做法｜本品\n冲泡｜要洗茶｜开水直接冲\n口感｜偏苦涩｜回味甘甜", key=key("compare"))
+            if lib and not it.get("white_bg"):
+                a = it.get("assets") or {}
+                modes = [(v, k) for k, v in al.MODES.items() if not (is_main and k == "photo")]   # 主图不实拍直出
+                # key 带上当前分配：分配变了（卡片上传照片、重新分配素材）就换成新值，没变时保留还没保存的选择
+                cur = f"{a.get('content') or ''}-{a.get('mode') or ''}-{a.get('source') or ''}-{it.get('shot') or ''}"
+                with gr.Row():
+                    asset_content = gr.Dropdown(
+                        label="素材照片（AI 照着它画，不凭空编）", interactive=True, value=a.get("content") or "",
+                        choices=[("不指定", "")] + [(al.describe(e), e["id"]) for e in lib],
+                        key=key(f"content-{cur}"))
+                    asset_mode = gr.Dropdown(
+                        label="出图方式", interactive=True,
+                        value=a.get("mode") if a.get("source") == "user" else "",
+                        choices=[("自动", "")] + modes, key=key(f"mode-{cur}"))
+                    if is_main:
+                        shot = gr.Textbox(value="", visible=False)
+                    else:
+                        shot = gr.Dropdown(label="拍法（实拍直出时不用）", interactive=True,
+                                           value=it.get("shot") if it.get("shot") in al.SHOTS else None,
+                                           choices=al.shot_choices(), key=key(f"shot-{cur}"))
+            else:
+                asset_content = gr.Textbox(value="", visible=False)
+                asset_mode = gr.Textbox(value="", visible=False)
+                shot = gr.Textbox(value="", visible=False)
             with gr.Accordion("画面描述（英文，改后点重新生成画面）", open=False):
                 scene = gr.Textbox(value=it.get("scene_prompt_en", ""), lines=4, show_label=False,
-                                   interactive=True)
+                                   interactive=True, key=key("scene"))
             with gr.Row():
                 btn_text = gr.Button("💾 保存文字并重排", size="sm", variant="primary")
                 btn_regen = gr.Button("🔄 重新生成画面", size="sm")
-    iid = it["id"]
+                btn_up = None if it.get("white_bg") else gr.UploadButton(
+                    "📷 上传这屏的参考照片", size="sm", file_types=["image"], file_count="single")
+    if btn_up is not None:
+        btn_up.upload(fn=lambda f, k=kind, i=iid: ecom_item_upload(k, i, f), inputs=[btn_up],
+                      outputs=[status_text, ecom_state, photo_state, ecom_product_md],
+                      concurrency_id="pipeline", concurrency_limit=1)
     # 写字方式取页面上的全局选项，「重新生成画面」按当前选择出图
     fields = [head, sub, badges, scene, ecom_text_mode, tag, price_label, price, specs, layout, compare]
+    # 白底图 / 没有素材库时这三个是隐藏占位框，传 None 表示不改素材
+    use_assets = bool(lib) and not it.get("white_bg")
+    fields += [asset_content, asset_mode, shot]
     # kind / iid 用默认参数绑定，避免闭包在循环中取到最后一个值
-    btn_text.click(fn=lambda *v, k=kind, i=iid: ecom_save_item(k, i, False, *v),
+    btn_text.click(fn=lambda *v, k=kind, i=iid, u=use_assets: ecom_save_item(k, i, False, *_asset_args(v, u)),
                    inputs=fields, outputs=[status_text, ecom_state], concurrency_id="pipeline", concurrency_limit=1)
-    btn_regen.click(fn=lambda *v, k=kind, i=iid: ecom_save_item(k, i, True, *v),
+    btn_regen.click(fn=lambda *v, k=kind, i=iid, u=use_assets: ecom_save_item(k, i, True, *_asset_args(v, u)),
                     inputs=fields, outputs=[status_text, ecom_state], concurrency_id="pipeline", concurrency_limit=1)
+
+
+def _asset_args(values, use_assets: bool):
+    """卡片输入 → ecom_save_item 的参数：没有素材控件时最后三个传 None（不改素材）"""
+    values = list(values)
+    return values if use_assets else values[:-3] + [None, None, None]
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
@@ -1274,6 +1483,14 @@ with gr.Blocks(title="AI 带货内容全链路流水线", **BLOCKS_KW) as demo:
                                 label="类目手册（决定卖点角度、详情页屏序、类目合规词）",
                             )
                             prod_playbook_md = gr.Markdown(playbook_info(_brief), elem_classes="hint")
+                        prod_positioning = gr.Dropdown(
+                            choices=pos.choices(),
+                            value=_brief.get("positioning") if _brief.get("positioning") in [v for _, v in pos.choices()]
+                            else pos.FOLLOW_PLATFORM,
+                            label="产品定位（决定详情页屏序、语气、画面方向和价格展示）",
+                            info="同一产品上不同渠道打法不同：拼多多拼性价比，微信 / 视频号私域讲品牌和故事。"
+                                 "选「跟随平台」时按所选平台自动决定",
+                        )
                         with gr.Accordion("➕ 新建 / 编辑自定义类目手册（内置手册里没有你的类目时用）", open=False):
                             gr.Markdown(
                                 "点「AI 起草」按上面的商品信息生成一份手册草稿，核对、修改后保存。"
@@ -1299,33 +1516,39 @@ with gr.Blocks(title="AI 带货内容全链路流水线", **BLOCKS_KW) as demo:
                         prod_persona = gr.Textbox(label="目标人群画像", value=_brief["persona"], lines=1)
                         prod_scenes = gr.Textbox(label="使用场景（每行一个）", value=_brief["scenes"], lines=2)
 
-            with gr.Accordion("③ 产品实拍图", open=True):
-                gr.Markdown(f"最多 {ecom.MAX_PRODUCT_REFS} 张不同角度（如正面 / 侧面 / 细节），包装文字清晰可辨。"
-                            "AI 以这些图为参考生成剧本需要的产品镜头图和主图/详情页，保证与实物一致。"
-                            "图下可写角度说明（帮助 AI 理解每张图）。点图片右上角 ✕ 删除，拖入新图即替换。",
-                            elem_classes="hint")
-                ecom_slots, ecom_labels = [], []
+            with gr.Accordion("③ 产品素材库（实拍照片）", open=True):
+                gr.Markdown(
+                    f"一次拖入多张（最多 {al.MAX_PHOTOS} 张），手机随手拍、精修图都可以：包装正面 / 背面（配料、标签）、"
+                    "产品本体（干茶、片剂）、使用中（茶汤、宠物进食）、叶底 / 质地、原料 / 产地、证书。"
+                    "上传后自动识别类型，策划时按类型给每屏分配素材：证据类的屏直接用实拍照片，"
+                    "需要新构图的屏以包装图锁定外观再生成。分错类型的直接在下面改。",
+                    elem_classes="hint")
                 with gr.Row():
-                    for slot in range(1, ecom.MAX_PRODUCT_REFS + 1):
-                        with gr.Column(min_width=120):
-                            # gr.Image 按原比例完整显示（不像 Gallery 缩略图那样裁成方块）
-                            ecom_slots.append(gr.Image(
-                                value=(lambda s=slot: ecom.product_slot_path(s)),
-                                label=f"产品图 {slot}" + ("（主）" if slot == 1 else ""),
-                                type="filepath", sources=["upload"], height=240,
-                            ))
-                            ecom_labels.append(gr.Textbox(
-                                value=(lambda s=slot: ecom.product_label(s)), show_label=False,
-                                placeholder=["正面平视，白底", "侧面 45°", "细节特写 / 使用中"][slot - 1]
-                                if slot <= 3 else "角度 / 内容说明",
-                            ))
+                    photo_upload = gr.File(label="拖入照片（可多选）", file_count="multiple", file_types=["image"],
+                                           height=110, scale=3)
+                    with gr.Column(scale=1, min_width=160):
+                        photo_auto_tag = gr.Checkbox(label="上传后自动识别类型（视觉模型，每 6 张一次调用）",
+                                                     value=True)
+                        btn_tag = gr.Button("🤖 自动识别类型", size="sm")
+                        btn_retag = gr.Button("重新识别（手动改过的不动）", size="sm")
                 ecom_product_md = gr.Markdown(ecom_product_note, elem_classes="hint")
+                photo_state = gr.State(al.load_library)
+
+                @gr.render(inputs=[photo_state])
+                def render_photos(lib):
+                    lib = lib or []
+                    if not lib:
+                        return
+                    for start in range(0, len(lib), 4):
+                        with gr.Row():
+                            for e in lib[start:start + 4]:
+                                render_photo_card(e)
             gr.Markdown("填好后切到上方「🎬 带货视频」或「🖼️ 主图 / 详情页」继续。每一步的进度和结果都显示在右侧运行日志。",
                         elem_classes="tip-card")
 
         # 顺序必须与 BRIEF_FIELDS 一致（INPUT_FIELDS + ANALYSIS_FIELDS）
         brief_inputs = [prod_name, prod_category, prod_desc, prod_audience, prod_price, prod_endorse, prod_color,
-                        prod_reviews, prod_playbook,
+                        prod_reviews, prod_playbook, prod_positioning,
                         prod_usp, prod_pain, prod_diff, prod_persona, prod_scenes]
         analysis_outputs = [prod_usp, prod_pain, prod_diff, prod_persona, prod_scenes]
 
@@ -1523,6 +1746,7 @@ with gr.Blocks(title="AI 带货内容全链路流水线", **BLOCKS_KW) as demo:
                     ecom_review = gr.Checkbox(
                         label="策划后让模型按评分标准自检并修改一轮（多一次 LLM 调用）", value=False)
                     btn_ecom_plan = gr.Button("① 策划图文 (LLM 出每张图的文案和画面)", variant="primary")
+                    btn_ecom_reassign = gr.Button("🔁 重新分配素材（补拍 / 改了照片类型后用，文案不变）", size="sm")
                     ecom_text_mode = gr.Radio(
                         choices=[(label, key) for key, label in ecom.TEXT_MODES.items()],
                         value=ecom.DEFAULT_TEXT_MODE, label="文字上图方式",
@@ -1561,17 +1785,18 @@ with gr.Blocks(title="AI 带货内容全链路流水线", **BLOCKS_KW) as demo:
                         return
                     meta = plan.get("meta", {})
                     ratio = meta.get("main_ratio", "1:1")
+                    lib = al.load_library()
                     mw, mh = ecom.TARGET_SIZES[ratio]
                     dw, dh = ecom.TARGET_SIZES[ecom.DETAIL_RATIO]
                     with gr.Tabs():
                         with gr.Tab(f"主图 {len(plan['main_images'])} 张 · {ratio}（{mw}×{mh}）"):
                             gr.Markdown(f"{meta.get('platform', '')} · 首图决定点击率", elem_classes="hint")
                             for it in plan["main_images"]:
-                                render_ecom_card("main", it, meta.get("playbook"))
+                                render_ecom_card("main", it, meta.get("playbook"), lib, meta.get("created", ""))
                         with gr.Tab(f"详情页 {len(plan['detail_sections'])} 张 · 3:4（{dw}×{dh}）"):
                             gr.Markdown("按序号逐张上传", elem_classes="hint")
                             for it in plan["detail_sections"]:
-                                render_ecom_card("detail", it, meta.get("playbook"))
+                                render_ecom_card("detail", it, meta.get("playbook"), lib, meta.get("created", ""))
 
     story_template.change(fn=template_info, inputs=[story_template], outputs=[template_desc])
     story_template.change(fn=lambda t: gr.update(visible=t == CUSTOM_TEMPLATE), inputs=[story_template],
@@ -1612,14 +1837,12 @@ with gr.Blocks(title="AI 带货内容全链路流水线", **BLOCKS_KW) as demo:
                         outputs=[status_text, final_video], **queue_kw)
     btn_layer4.click(fn=manual_concat, inputs=[], outputs=[status_text, final_video], **queue_kw)
 
-    for slot, img in enumerate(ecom_slots, 1):
-        # slot 用默认参数绑定，避免闭包在循环中取到最后一个值
-        img.upload(fn=lambda f, s=slot: ecom_set_product(s, f), inputs=[img],
-                   outputs=[status_text, ecom_product_md])
-        img.clear(fn=lambda s=slot: ecom_set_product(s, None), inputs=[],
-                  outputs=[status_text, ecom_product_md])
-    for slot, box in enumerate(ecom_labels, 1):
-        box.blur(fn=lambda t, s=slot: ecom.set_product_label(s, t), inputs=[box], outputs=[])
+    photo_upload.upload(fn=ecom_add_photos, inputs=[photo_upload, photo_auto_tag],
+                        outputs=[status_text, photo_state, photo_upload, ecom_product_md], **queue_kw)
+    btn_tag.click(fn=lambda: ecom_tag_photos(False), inputs=[],
+                  outputs=[status_text, photo_state, ecom_product_md], **queue_kw)
+    btn_retag.click(fn=lambda: ecom_tag_photos(True), inputs=[],
+                    outputs=[status_text, photo_state, ecom_product_md], **queue_kw)
     btn_ecom_plan.click(fn=ecom_plan,
                         inputs=[ecom_platform, ecom_use_chars, ecom_main_count, ecom_main_ratio, ecom_review]
                         + brief_inputs,
@@ -1627,8 +1850,9 @@ with gr.Blocks(title="AI 带货内容全链路流水线", **BLOCKS_KW) as demo:
     btn_ecom_gen.click(fn=ecom_generate_all, inputs=[ecom_force, ecom_text_mode, ecom_fidelity],
                        outputs=[status_text, ecom_state], **queue_kw)
     btn_ecom_export.click(fn=ecom_export, inputs=[], outputs=[status_text, ecom_zip])
+    btn_ecom_reassign.click(fn=ecom_reassign, inputs=[], outputs=[status_text, ecom_state], **queue_kw)
     btn_ecom_clear.click(fn=ecom_clear, inputs=[],
-                         outputs=[status_text, ecom_state, ecom_zip, ecom_product_md] + ecom_slots + ecom_labels,
+                         outputs=[status_text, ecom_state, ecom_zip, ecom_product_md, photo_state],
                          **queue_kw)
 
 if __name__ == "__main__":
