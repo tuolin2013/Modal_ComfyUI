@@ -33,3 +33,6 @@ _h3/
 
 # MacOS
 .DS_Store
+
+# 评测结果（本地对比用）
+pipeline/evals/results/

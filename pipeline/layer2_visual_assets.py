@@ -39,19 +39,36 @@ RIGHT_CODES_DRAW_KEY = os.environ.get("RIGHT_CODES_DRAW_KEY", "")
 # 默认使用 gpt-image-2.5（高质量，兼容 OpenAI images.generate 接口）
 DEFAULT_IMAGE_MODEL = os.environ.get("IMAGE_MODEL", "gpt-image-2.5")
 
-# 带货竖版：1024×1792；横版/正方：1024×1024
-DEFAULT_SIZE = os.environ.get("IMAGE_SIZE", "1024x1792")  # 9:16 竖屏
+# 带货竖版 9:16：1008×1792（16 的倍数）；正常由分镜 meta.image_size（目标平台）决定，这里只是兜底
+DEFAULT_SIZE = os.environ.get("IMAGE_SIZE", "1008x1792")  # 9:16 竖屏
 
 # 角色定妆照固定竖版，便于容纳全身
-PORTRAIT_SIZE = "1024x1792"
+PORTRAIT_SIZE = "1008x1792"
 CHARACTER_DIR = "./pipeline/output/assets/characters"
 
 
 # ── 每个镜头对应的生图风格前缀 ────────────────────────────────────────────────
+# 产品特写（B-Roll）用棚拍质感；有人物或生活场景的镜头用生活纪实质感：
+# 观众要觉得「这就是我的生活」，影棚光和干净背景会让人物镜头像广告片，失去代入感
 STYLE_PREFIX = (
     "Product photography, professional studio shot, ultra-sharp, photorealistic, "
     "commercial advertising quality, 4K resolution, clean background, "
 )
+LIFESTYLE_PREFIX = (
+    "Candid lifestyle photograph, shot on a phone or a 35mm lens, natural available light, "
+    "real lived-in everyday setting with small authentic imperfections, "
+    "any people look like ordinary relatable people with unposed natural expressions, "
+    "photorealistic, no studio lighting, no seamless backdrop, "
+)
+# 这些节拍是纯产品特写，用棚拍质感；工艺、开箱、产地这类节拍是纪实画面，按生活场景处理
+PRODUCT_BEATS = {"卖点展示", "信任背书", "对比实验"}
+
+
+def style_prefix(shot: dict) -> str:
+    """有人物出场、或节拍不是产品特写的镜头用生活纪实风格"""
+    if shot.get("characters") or shot.get("emotion_beat") not in PRODUCT_BEATS:
+        return LIFESTYLE_PREFIX
+    return STYLE_PREFIX
 
 # 定妆照：中性表情、正面全身、纯色背景、平光。参考图越"干净"，H3 越容易只提取人物身份而不带入多余元素
 PORTRAIT_PREFIX = (
@@ -60,14 +77,74 @@ PORTRAIT_PREFIX = (
     "background, soft even lighting, no props, no text, photorealistic, sharp focus, "
 )
 
-# 带货场景 → 额外风格修饰词映射
-EMOTION_BEAT_STYLE: dict[str, str] = {
-    "开场钩子":   "dramatic lighting, hero shot, ",
+# 节拍 → 额外风格修饰词。分棚拍和生活两套，跟前缀一起选，避免「no studio」后面又接「clean studio」
+# （新节拍名没有映射时不加修饰词）。都不用 medical / clinical 风格：画面暗示医疗功效同样有合规风险
+STUDIO_BEAT_STYLE: dict[str, str] = {
     "卖点展示":   "clean white/gradient background, product centered, macro detail, ",
-    "使用场景":   "lifestyle photography, natural warm lighting, model using product, ",
-    "信任背书":   "clinical white background, scientific/medical aesthetic, ",
-    "行动召唤":   "bright vibrant colors, energetic composition, urgency feel, ",
+    "信任背书":   "clean bright studio, crisp detail close-up, trustworthy mood, ",
+    "对比实验":   "side-by-side comparison setup, identical lighting on both sides, clean background, ",
 }
+LIFESTYLE_BEAT_STYLE: dict[str, str] = {
+    "开场钩子":   "a relatable everyday moment caught mid-action, ",
+    "使用场景":   "the person naturally using the product in their own space, ",
+    "行动召唤":   "warm satisfied everyday moment, product naturally in frame, ",
+    "开箱":       "top-down unboxing on a real desk, soft daylight, hands opening the package, ",
+    "使用步骤":   "clear hands-on demonstration in a real home setting, close-up of hands and product, ",
+    "产地溯源":   "documentary landscape photography, natural light, authentic rural setting, ",
+    "工艺细节":   "documentary close-up of the craft process, natural texture, real workshop or field setting, ",
+    # 产品特写节拍里有人出镜时的生活版本
+    "卖点展示":   "the person holds the product close to the camera in natural light, product details clearly visible, ",
+    "信任背书":   "close-up of hands examining the product in natural light, honest unpolished feel, ",
+    "对比实验":   "a simple side-by-side comparison on a real desk or kitchen counter, same natural light on both sides, ",
+}
+# 旧名字：所有节拍的修饰词（棚拍优先），给只想查某个节拍有没有风格的调用方
+EMOTION_BEAT_STYLE: dict[str, str] = {**LIFESTYLE_BEAT_STYLE, **STUDIO_BEAT_STYLE}
+
+# 画幅 → 构图提示（程序加，不靠模型记得）
+FRAMING = {"9:16": "vertical 9:16 composition, ", "16:9": "horizontal 16:9 composition, ",
+           "1:1": "square 1:1 composition, ", "3:4": "vertical 3:4 composition, "}
+
+
+def beat_style(shot: dict) -> str:
+    beat = shot.get("emotion_beat", "")
+    table = STUDIO_BEAT_STYLE if style_prefix(shot) == STYLE_PREFIX else LIFESTYLE_BEAT_STYLE
+    return table.get(beat, "")
+
+
+def compose_shot_prompt(shot: dict, storyboard: dict | None = None) -> str:
+    """
+    镜头底图的完整提示词 = 风格前缀 + 节拍修饰 + 画幅 + 场景设定原文 + 出场角色外貌原文 + 本镜的 image_gen_prompt。
+    场景和角色由程序按 id 拼进去，不靠模型在每镜里抄写（模型常改写或省略，镜头之间就会漂）；
+    image_gen_prompt 里已经原样包含的设定不重复拼接
+    """
+    storyboard = storyboard or {}
+    script = storyboard.get("script") or {}
+    own = str(shot.get("image_gen_prompt") or "").strip()
+    parts = [style_prefix(shot), beat_style(shot),
+             FRAMING.get((storyboard.get("meta") or {}).get("aspect_ratio"), "")]
+    scenes = {s.get("id"): s for s in script.get("scenes") or [] if isinstance(s, dict)}
+    scene = scenes.get(shot.get("scene"))
+    desc = str((scene or {}).get("description_en") or "").strip().rstrip(".")
+    if desc and desc not in own:
+        parts.append(f"Setting: {desc}. ")
+    chars = {c.get("id"): c for c in script.get("characters") or [] if isinstance(c, dict)}
+    for cid in shot.get("characters") or []:
+        look = str((chars.get(cid) or {}).get("appearance_en") or "").strip().rstrip(".")
+        if look and look not in own:
+            parts.append(f"{(chars[cid].get('name') or cid)}: {look}. ")
+    parts.append(own)
+    return "".join(parts).strip()
+
+
+def fallback_size(size: str) -> str:
+    """OpenAI 文档列出的标准尺寸（1024x1024 / 1024x1536 / 1536x1024），按原尺寸的横竖方向选"""
+    try:
+        w, h = (int(v) for v in str(size).lower().replace("×", "x").split("x"))
+    except ValueError:
+        return "1024x1024"
+    if w == h:
+        return "1024x1024"
+    return "1024x1536" if h > w else "1536x1024"
 
 
 def _generate_image(final_prompt: str, output_path: str, model: str, size: str, label: str) -> str:
@@ -99,6 +176,12 @@ def _generate_image(final_prompt: str, output_path: str, model: str, size: str, 
             )
             if resp.status_code == 200:
                 break
+            # 平台不接受这个尺寸：换成同方向的标准尺寸再试（不扣费，请求被拒时还没开始生成）
+            fallback = fallback_size(payload["size"])
+            if 400 <= resp.status_code < 500 and "size" in resp.text.lower() and fallback != payload["size"]:
+                print(f"[层2] 不支持尺寸 {payload['size']}，改用 {fallback}")
+                payload["size"] = fallback
+                continue
             if (resp.status_code >= 500 or resp.status_code == 429) and attempt < max_retries - 1:
                 print(f"[{attempt+1}/{max_retries}] API 返回 {resp.status_code}，10 秒后重试...")
                 time.sleep(10)
@@ -139,10 +222,11 @@ def generate_shot_image(
     output_dir: str = "./pipeline/output/assets/shots",
     model: str = DEFAULT_IMAGE_MODEL,
     size: str = DEFAULT_SIZE,
+    storyboard: dict | None = None,
 ) -> str:
-    """为单个分镜生成静态基底图，返回保存路径"""
+    """为单个分镜生成静态基底图，返回保存路径。storyboard 用来拼场景/角色设定和画幅"""
     beat = shot.get("emotion_beat", "")
-    final_prompt = STYLE_PREFIX + EMOTION_BEAT_STYLE.get(beat, "") + shot.get("image_gen_prompt", "")
+    final_prompt = compose_shot_prompt(shot, storyboard)
     output_path = os.path.join(output_dir, f"shot_{int(shot['id']):02d}_base.png")
     return _generate_image(final_prompt, output_path, model, size, f"镜头{shot['id']} 基底图 ({beat})")
 
@@ -214,7 +298,8 @@ def generate_all_shots(
         if old and os.path.exists(old) and Path(old).parent.resolve() == Path(output_dir).resolve():
             print(f"[层2] 镜头 {shot['id']} 已有底图，跳过")
             continue
-        shot["image_path"] = generate_shot_image(shot, output_dir=output_dir, model=model, size=size)
+        shot["image_path"] = generate_shot_image(shot, output_dir=output_dir, model=model, size=size,
+                                                 storyboard=storyboard)
         with open(storyboard_path, "w", encoding="utf-8") as f:
             json.dump(storyboard, f, ensure_ascii=False, indent=2)
 

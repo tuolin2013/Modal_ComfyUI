@@ -11,7 +11,8 @@ MiniMax H3 批量渲染服务（Modal + Diffusers）
   Runner = modal.Cls.from_name("minimax-h3-diffusers-service", "H3BatchRunner")
   t2va   = Runner(workflow="t2va")
   ref2va = Runner(workflow="ref2va")
-  video_bytes = ref2va.render_single_shot.remote(prompt, [img1_bytes, img2_bytes], 124, seed)
+  video_bytes = ref2va.render_single_shot.remote(prompt, [img1_bytes, img2_bytes], 124, seed,
+                                                 aspect_ratio="9:16")
 
 设计要点：
   - workflow 是类参数：t2va 和 ref2va 各有独立的容器池，各自只加载一次模型，
@@ -235,6 +236,36 @@ def _valid_frames(frames: int) -> int:
     return min(17 * n + 5, MAX_FRAMES)
 
 
+# 不传 height/width 时 H3 一律按 16:9 出图（t2va 和 ref2va 都是），竖屏平台会变成横屏。
+# 下面三个数与 diffusers 的 canvas_short_edge / canvas_max_pixels / canvas_multiple 默认值一致，
+# 换算规则照抄 diffusers.modular_pipelines.minimax_h3.resolve_canvas_size：
+#   9:16 → 768×1344（宽×高），1:1 → 768×768，16:9 → 1344×768
+CANVAS_SHORT_EDGE = 768
+CANVAS_MAX_PIXELS = 768 * 1344
+CANVAS_MULTIPLE = 32
+DEFAULT_ASPECT_RATIO = "16:9"   # 与 H3 自身默认一致，兼容不传比例的旧客户端
+
+
+def _canvas_size(aspect_ratio: str | None) -> tuple[int, int]:
+    """把 "9:16" 这样的画幅换算成 H3 的 (height, width)；格式不对或超出 1:4–4:1 时报错"""
+    text = str(aspect_ratio or DEFAULT_ASPECT_RATIO).strip().replace("：", ":")
+    try:
+        w, h = (float(x) for x in text.split(":"))
+    except ValueError:
+        raise ValueError(f"画幅格式应为 宽:高（如 9:16），收到 {aspect_ratio!r}") from None
+    if w <= 0 or h <= 0 or not 0.25 <= w / h <= 4:
+        raise ValueError(f"H3 只支持 1:4 到 4:1 的画幅，收到 {aspect_ratio!r}")
+
+    ratio = w / h
+    width, height = (CANVAS_SHORT_EDGE * ratio, float(CANVAS_SHORT_EDGE)) if ratio >= 1 \
+        else (float(CANVAS_SHORT_EDGE), CANVAS_SHORT_EDGE / ratio)
+    if width * height > CANVAS_MAX_PIXELS:
+        scale = (CANVAS_MAX_PIXELS / (width * height)) ** 0.5
+        width, height = width * scale, height * scale
+    m = CANVAS_MULTIPLE
+    return max(m, round(height / m) * m), max(m, round(width / m) * m)
+
+
 @app.cls(
     gpu=GPU,
     image=image,
@@ -322,6 +353,7 @@ class H3BatchRunner:
         duration_frames: int = 124,
         seed: int | None = None,
         num_inference_steps: int = 30,
+        aspect_ratio: str | None = None,
     ) -> bytes:
         """
         渲染单个镜头，返回 mp4 字节（含 H3 生成的音轨）。
@@ -331,6 +363,7 @@ class H3BatchRunner:
             images: 参考图字节列表，顺序即 <Picture N>；兼容旧调用：直接传单个 bytes
             duration_frames: 帧数（24fps）
             seed: 随机种子；全片共用同一个种子可让画风更统一
+            aspect_ratio: 画幅，如 "9:16" / "1:1" / "16:9"；不传按 H3 默认 16:9
         """
         import os
         import tempfile
@@ -355,9 +388,13 @@ class H3BatchRunner:
         if frames != int(duration_frames):
             print(f">>> 帧数 {duration_frames} 不在 H3 允许范围，调整为 {frames}")
             duration_frames = frames
+        # 在加载参考图之前换算，画幅写错时立即报错，不白占 GPU
+        height, width = _canvas_size(aspect_ratio)
         kwargs = dict(
             prompt=prompt,
             num_frames=frames,
+            height=height,
+            width=width,
             num_inference_steps=num_inference_steps,
             output=["videos", "audio", "sampling_rate"],
         )
@@ -365,7 +402,8 @@ class H3BatchRunner:
             kwargs["generator"] = torch.Generator("cuda").manual_seed(int(seed))
 
         t0 = time.time()
-        print(f">>> [{self.workflow}] {len(images)} 张参考图 | {duration_frames} 帧 | seed={seed} | {prompt[:60]}...")
+        print(f">>> [{self.workflow}] {len(images)} 张参考图 | {duration_frames} 帧 | {width}x{height} "
+              f"({aspect_ratio or DEFAULT_ASPECT_RATIO}) | seed={seed} | {prompt[:60]}...")
 
         # 临时目录随 with 结束自动删除，容器连续渲染时不会堆积文件
         with tempfile.TemporaryDirectory() as tmpdir:

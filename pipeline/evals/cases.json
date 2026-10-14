@@ -1,0 +1,56 @@
+{
+  "_说明": "评测集：每条用例是一个真实产品 + 一个平台 + 一个剧本模板。改提示词、模板或技能后跑一遍，对比分数。只放用户提供的真实信息，不要编数据。",
+  "cases": [
+    {
+      "id": "cat-douyin",
+      "brief": {
+        "name": "猫静宝",
+        "category": "宠物营养补充剂",
+        "description": "主要原料：首乌藤、远志、葛根、甘草、纯粮提取物、鸡肝粉、糊精；添加维生素A、D3、天然维生素E。风味片剂，适用于犬、猫，发情前期及发情期连续饲喂。猫每天 2 片；犬每 5 公斤体重 1 片/天。0.4 克/片，30 片/盒。保质期 24 个月。生产许可证：鄂饲预（2023）12001，执行标准 Q/HBCY 326-2025。",
+        "usp": "发情期陪它安稳过渡（植物配伍）\n鸡肝风味，喂片不用掰嘴\n持证生产可查（鄂饲预）\n猫狗通用，用量清楚好掌握",
+        "pain_points": "一到发情期就整夜嚎叫打滚，吵得人睡不着，邻居还来敲门\n喂片剂像打仗，掰嘴硬塞还被挠",
+        "persona": "25-35 岁城市独居养宠青年，猫咪未绝育或暂不绝育",
+        "brand_color": "#C8A882"
+      },
+      "platform": "抖音/快手（竖版 9:16）",
+      "template": "经典反转 · 4镜"
+    },
+    {
+      "id": "cat-taobao",
+      "same_brief_as": "cat-douyin",
+      "platform": "淘宝/京东 主图视频（方形 1:1）",
+      "template": "商品展示 · 4镜"
+    },
+    {
+      "id": "berry-tea-shipinhao",
+      "brief": {
+        "name": "张家界莓茶",
+        "category": "代用茶",
+        "description": "产自湖南张家界武陵山区，海拔 400-1500 米、常年云雾的山地。原料为小叶种显齿蛇葡萄（小叶种藤茶）的幼嫩茎叶，土家族传统茶饮。工艺：采摘嫩芽叶，杀青、揉捻、晒干。加工后叶片表面析出一层白霜，冲泡时遇热水溶开。冲泡：95℃ 以上开水直接冲泡，不用洗茶，第一泡就能喝；一次 3-5 克。口感回味甘甜。净含量 100 克/罐。",
+        "endorsements": "",
+        "usp": "武陵山区云雾山地采的嫩茎叶\n叶片自带白霜，冲泡看得见\n开水直接冲，不用洗茶\n回味甘甜",
+        "persona": "30-50 岁注重日常饮食、习惯在办公室泡茶的上班族",
+        "brand_color": "#6B8E4E"
+      },
+      "platform": "视频号（竖版 9:16）",
+      "template": "产地故事 · 5镜"
+    },
+    {
+      "id": "berry-tea-douyin",
+      "same_brief_as": "berry-tea-shipinhao",
+      "platform": "抖音/快手（竖版 9:16）",
+      "template": "口播种草 · 4镜"
+    }
+  ],
+  "_ecom_说明": "主图 / 详情页评测：同一产品在不同渠道的定位不同（拼多多性价比，微信小店高端），检查屏序、价格策略和合规。跑法：python -m evals.run_eval --ecom",
+  "ecom_cases": [
+    {"id": "berry-tea-pdd", "same_brief_as": "berry-tea-shipinhao", "platform": "拼多多", "positioning": "auto",
+     "expect_positioning": "value"},
+    {"id": "berry-tea-wechat", "same_brief_as": "berry-tea-shipinhao", "platform": "微信小店", "positioning": "auto",
+     "expect_positioning": "premium"},
+    {"id": "cat-pdd", "same_brief_as": "cat-douyin", "platform": "拼多多", "positioning": "auto",
+     "expect_positioning": "value"},
+    {"id": "cat-wechat", "same_brief_as": "cat-douyin", "platform": "微信小店", "positioning": "premium",
+     "expect_positioning": "premium"}
+  ]
+}

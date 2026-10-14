@@ -5,3 +5,6 @@ modal
 python-dotenv
 requests
 Pillow
+# 主图/详情页「程序叠字」的 HTML/CSS 模板排版；装完还要下载浏览器：python -m playwright install chromium
+jinja2==3.1.6
+playwright==1.63.0
