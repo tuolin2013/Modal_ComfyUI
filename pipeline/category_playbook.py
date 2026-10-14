@@ -21,7 +21,7 @@ import json
 import re
 from pathlib import Path
 
-import category_packs as packs
+import categories as cats
 
 AUTO = "auto"
 GENERAL = "general"
@@ -252,12 +252,13 @@ def _inherit(parent: dict, child: dict) -> dict:
     return pb
 
 
-# 商用标准包注册为内置手册，排在各自 parent 前面识别
-for _key, _pack in packs.STANDARD_PACKS.items():
-    PLAYBOOKS[_key] = _inherit(PLAYBOOKS[_pack["parent"]], _pack)
-STANDARD_KEYS = tuple(packs.STANDARD_PACKS)
+# 商用标准包（categories/ 下的类目）注册为内置手册，排在各自 parent 前面识别
+for _cat in cats.registered():
+    if _cat.playbook:
+        PLAYBOOKS[_cat.key] = {**_inherit(PLAYBOOKS[_cat.parent], _cat.playbook), "parent": _cat.parent}
+STANDARD_KEYS = tuple(c.key for c in cats.registered() if c.playbook)
 DETECT_ORDER = tuple(k for base in BASE_DETECT_ORDER
-                     for k in [p for p, before in packs.DETECT_BEFORE.items() if before == base] + [base])
+                     for k in [c.key for c in cats.registered() if c.playbook and c.parent == base] + [base])
 BUILTIN_KEYS = DETECT_ORDER + (GENERAL,)
 
 
@@ -414,6 +415,19 @@ def resolve(brief: dict) -> str:
     if chosen in PLAYBOOKS or (chosen.startswith(CUSTOM_PREFIX) and chosen in load_custom()):
         return chosen
     return detect(brief)
+
+
+def category(key: str | None) -> cats.Category:
+    """
+    这个类目手册怎么出图（主图拍什么、每屏找哪类照片、参考图怎么说明、画面要求）。
+    自定义手册沿用 parent 的生成策略；没有专属策略的类目（通用、内置的轻量手册）用 categories.GENERIC，
+    行为与重构前一致。
+    """
+    key = key or GENERAL
+    if key.startswith(CUSTOM_PREFIX):
+        custom = load_custom().get(key)
+        return cats.get(custom["parent"] if custom else GENERAL)
+    return cats.get(key)
 
 
 def get(key: str | None) -> dict:

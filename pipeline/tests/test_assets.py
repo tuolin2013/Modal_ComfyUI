@@ -278,7 +278,7 @@ def test_photo_mode_composes_locally(tmp_path, monkeypatch):
 def _capture_edit(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(ecom, "BASE_DIR", tmp_path / "base")
-    monkeypatch.setattr(ecom, "compose_item", lambda plan, kind, it: "")
+    monkeypatch.setattr(ecom, "compose_item", lambda plan, kind, it, cat=None: "")
 
     def fake_edit(prompt, paths, out, ratio, allow_empty=False):
         calls.append((prompt, paths, allow_empty))
@@ -321,7 +321,7 @@ def test_white_main_uses_white_package_photo(tmp_path, monkeypatch):
     lib = _lib(tmp_path, ["package_front"])
     lib[0]["quality"]["white_bg"] = True
     monkeypatch.setattr(ecom, "BASE_DIR", tmp_path / "base")
-    monkeypatch.setattr(ecom, "compose_item", lambda plan, kind, it: "")
+    monkeypatch.setattr(ecom, "compose_item", lambda plan, kind, it, cat=None: "")
     monkeypatch.setattr(ecom, "edit_image", lambda *a, **k: pytest.fail("白底实拍不应调用生图接口"))
     item = {"id": "M5", "ratio": "1:1", "role": "白底图", "white_bg": True}
     ecom.render_item({"meta": {}}, "main", item, [], {}, library=lib)

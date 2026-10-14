@@ -35,7 +35,7 @@ TEA_TYPES = ["package_front", "package_back", "raw_material", "product_closeup",
 def _capture_edit(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(ecom, "BASE_DIR", tmp_path / "base")
-    monkeypatch.setattr(ecom, "compose_item", lambda plan, kind, it: "")
+    monkeypatch.setattr(ecom, "compose_item", lambda plan, kind, it, cat=None: "")
 
     def fake_edit(prompt, paths, out, ratio, allow_empty=False):
         calls.append((prompt, paths, allow_empty))
@@ -215,7 +215,7 @@ def test_render_many_reuses_base(tmp_path, monkeypatch):
         Image.new("RGB", (10, 10)).save(p)
         it.update(base_path=str(p), base_mode="overlay", base_key="legacy")
     monkeypatch.setattr(ecom, "render_item", lambda *a, **k: pytest.fail("能复用的底图不该重画"))
-    monkeypatch.setattr(ecom, "compose_item", lambda plan, kind, it: it.update(final_path="f.jpg"))
+    monkeypatch.setattr(ecom, "compose_item", lambda plan, kind, it, cat=None: it.update(final_path="f.jpg"))
     out = list(ecom.render_many(plan, jobs, ["p.png"], {}, library=[], workers=2))
     assert [s for _, _, s, _ in out] == ["reused", "reused"]
     assert all(it["final_path"] == "f.jpg" for it in plan["main_images"])

@@ -398,12 +398,19 @@ NEIGHBOR_PENALTY = 6.0
 MODES = {"photo": "实拍直出", "reference": "参考重绘", "generate": "纯生成（无产品）"}
 
 
-def role_need(role: str, main: bool = False) -> dict:
+def rules_for(cat=None) -> list[tuple[str, dict]]:
+    """这个类目的素材规则 + 通用规则：类目的排在前面，先命中的生效（类目没有的往下走通用）"""
+    return list(getattr(cat, "role_rules", ()) or ()) + ROLE_RULES
+
+
+def role_need(role: str, main: bool = False, cat=None) -> dict:
     """
+    cat：类目（categories.Category）。它自己的规则先匹配，没有再走通用规则；
+         「叶底」「茶汤」「适口」这类词只写在对应类目里，不加类目的屏不受影响。
     main：主图。主图一律出现产品（搜索结果里没有产品的图没人点）、不实拍直出、缺照片也不拦；
     只能实拍直出的类型（背面 / 证书）对主图没用，这类规则跳过，往下匹配（如「细节/证据图：…特写」按特写处理）
     """
-    for pattern, need in ROLE_RULES:
+    for pattern, need in rules_for(cat):
         if main and set(need["types"]) <= PHOTO_ONLY_TYPES:
             continue
         if re.search(pattern, str(role or "")):
@@ -411,10 +418,10 @@ def role_need(role: str, main: bool = False) -> dict:
     return {**DEFAULT_NEED, "photo": False} if main else DEFAULT_NEED
 
 
-def _title_specific(role: str) -> bool:
+def _title_specific(role: str, cat=None) -> bool:
     """屏的标题（「：」前）就点明了要什么素材（如「叶底特写」），比只在说明里提到（「核心卖点：一层白霜」）更专门"""
     head = re.split(r"[：:]", str(role or ""), maxsplit=1)[0]
-    return any(re.search(p, head) for p, _ in ROLE_RULES)
+    return any(re.search(p, head) for p, _ in rules_for(cat))
 
 
 def _match(need: dict, e: dict) -> float | None:
@@ -425,7 +432,7 @@ def _match(need: dict, e: dict) -> float | None:
     return 10.0 - 3.0 * need["types"].index(t)
 
 def assign(roles: list[str], lib: list[dict], allow_photo: bool = True,
-           fixed: dict[int, dict] | None = None, main: bool = False) -> list[dict]:
+           fixed: dict[int, dict] | None = None, main: bool = False, cat=None) -> list[dict]:
     """
     给每屏分配素材，返回与 roles 等长的列表，每项：
       {"content": 内容照片 id 或 "", "refs": [参考图 id，包装图在前], "mode": photo|reference|generate,
@@ -434,17 +441,18 @@ def assign(roles: list[str], lib: list[dict], allow_photo: bool = True,
     分数 = 类型匹配 + 3×质量 − 重复使用 − 相邻屏同图。
     fixed：{屏序号(0 起): 已有分配}，用户手动改过的屏保持不变，并参与重复 / 相邻惩罚
     main：给主图分配（见 role_need），主图不实拍直出
+    cat：类目（categories.Category），决定每屏要哪类照片
     """
     fixed = fixed or {}
     allow_photo = allow_photo and not main
-    needs = [role_need(r, main) for r in roles]
+    needs = [role_need(r, main, cat) for r in roles]
     out: list[dict | None] = [fixed.get(i) for i in range(len(roles))]
     uses = Counter(a["content"] for a in out if a and a.get("content"))
     # 主图不实拍直出，文字多的照片（背面 / 证书）对主图没用
     cands = [[e for e in lib if _match(n, e) is not None and not (main and e.get("type") in PHOTO_ONLY_TYPES)]
              for n in needs]
     order = sorted((i for i in range(len(roles)) if out[i] is None),
-                   key=lambda i: (len(cands[i]) or 99, not _title_specific(roles[i]), i))
+                   key=lambda i: (len(cands[i]) or 99, not _title_specific(roles[i], cat), i))
     pkg = package_refs(lib, 2)
     for i in order:
         need = needs[i]
@@ -496,7 +504,7 @@ def plan_one(need: dict, content: dict | None, pkg: list[dict], allow_photo: boo
             "source": "auto"}
 
 
-def plan_shots(roles: list[str], assets: list[dict] | None = None) -> list[str]:
+def plan_shots(roles: list[str], assets: list[dict] | None = None, cat=None) -> list[str]:
     """
     每屏的拍法：在这一屏偏好的前两种里挑整套用得少的，并跳过上一屏的拍法。
     实拍直出的屏记为 photo（画面就是照片本身）
@@ -507,7 +515,7 @@ def plan_shots(roles: list[str], assets: list[dict] | None = None) -> list[str]:
             shots.append("photo")
             continue
         prev = shots[-1] if shots else ""
-        prefs = [s for s in role_need(role)["shots"] if s != prev] or [s for s in SHOTS if s != prev]
+        prefs = [s for s in role_need(role, cat=cat)["shots"] if s != prev] or [s for s in SHOTS if s != prev]
         pick = min(prefs[:2], key=lambda s: (used[s], prefs.index(s)))
         shots.append(pick)
         used[pick] += 1

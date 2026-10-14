@@ -5,7 +5,8 @@ import json
 import pytest
 
 import asset_library as al
-import category_packs as packs
+from categories import pet_supplement as pet_pack
+from categories import tea as tea_pack
 import category_playbook as cp
 import ecom_images as ecom
 import layer1_planning as l1
@@ -63,8 +64,8 @@ def test_ecom_plan_follows_platform_positioning(monkeypatch):
     pdd = ecom.generate_ecom_plan("张家界莓茶", ["白霜"], "#6B8E4E", "拼多多", playbook="tea", library=[])
     wx = ecom.generate_ecom_plan("张家界莓茶", ["白霜"], "#6B8E4E", "微信小店", playbook="tea", library=[])
     assert pdd["meta"]["positioning"] == "value" and wx["meta"]["positioning"] == "premium"
-    assert [d["role"] for d in pdd["detail_sections"]] == packs.TEA_PLANS["value"]
-    assert [d["role"] for d in wx["detail_sections"]] == packs.TEA_PLANS["premium"]
+    assert [d["role"] for d in pdd["detail_sections"]] == tea_pack.PLANS["value"]
+    assert [d["role"] for d in wx["detail_sections"]] == tea_pack.PLANS["premium"]
     assert "【产品定位：性价比】" in seen[0] and "【产品定位：高端礼赠】" in seen[1]
     # 高端：程序清掉主图价格，并把定位的画面方向拼进整套视觉设定
     assert all(m["price"] == "" for m in wx["main_images"]) and pdd["main_images"][0]["price"] == "【券后价】"
@@ -109,7 +110,7 @@ def test_packs_registered_and_inherit_parent():
     assert not cp.is_standard("food")
 
 
-@pytest.mark.parametrize("key", list(packs.STANDARD_PACKS))
+@pytest.mark.parametrize("key", list(cp.STANDARD_KEYS))
 def test_pack_plans_are_complete(key):
     pb = cp.get(key)
     assert set(pb["positioning_plans"]) == set(pos.POSITIONINGS)
@@ -124,7 +125,7 @@ EXPECTED_PHOTO = {"冲泡方法": "in_use", "喂养方法": "in_use", "冲泡仪
                   "叶底特写": "texture_detail", "适口性": "texture_detail", "产品特写": "texture_detail"}
 
 
-@pytest.mark.parametrize("role", sorted({r for plans in (packs.TEA_PLANS, packs.PET_PLANS)
+@pytest.mark.parametrize("role", sorted({r for plans in (tea_pack.PLANS, pet_pack.PLANS)
                                          for plan in plans.values() for r in plan}))
 def test_pack_screens_route_to_right_photos(role):
     """标准包的屏用词要能被素材分配规则认出来：冲泡屏找冲泡照片，资质屏找证书，规格屏找包装背面"""

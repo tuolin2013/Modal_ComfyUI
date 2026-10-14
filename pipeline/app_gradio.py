@@ -891,6 +891,11 @@ def ecom_product_note() -> str:
     return "⚠️ 还没有产品图。建议至少上传：包装正面、包装背面（配料 / 标签），以及产品本体、使用中的实拍。"
 
 
+def current_category():
+    """当前产品信息对应的类目生成策略（照片识别、卡片保存都用它）"""
+    return cp.category(cp.resolve(brief_mod.load_brief()))
+
+
 def ecom_add_photos(files, auto_tag: bool):
     """上传多张照片进素材库；auto_tag 时立即用视觉模型识别类型（每 6 张一次调用）"""
     try:
@@ -898,7 +903,7 @@ def ecom_add_photos(files, auto_tag: bool):
         added, skipped = al.add_photos([p for p in paths if p])
         msg = f"📥 新增 {len(added)} 张" + (f"；跳过 {len(skipped)} 张：" + "；".join(skipped) if skipped else "")
         if added and auto_tag:
-            done, errors = ecom.classify_photos(added)
+            done, errors = ecom.classify_photos(added, cat=current_category())
             msg += f"\n🤖 已识别 {done} 张类型，请在缩略图下核对，分错的直接改。"
             if errors:
                 msg += "\n⚠️ " + "\n⚠️ ".join(errors) + "\n未识别的请手动选类型（视觉模型由 ECOM_CHECK_MODEL 指定）。"
@@ -913,7 +918,7 @@ def ecom_tag_photos(force: bool = False):
         todo = al.needs_tagging(al.load_library(), force)
         if not todo:
             return "✅ 没有需要识别的照片（手动改过类型的不会被覆盖）", al.load_library(), ecom_product_note()
-        done, errors = ecom.classify_photos(todo)
+        done, errors = ecom.classify_photos(todo, cat=current_category())
         msg = f"🤖 已识别 {done}/{len(todo)} 张。" + ("\n⚠️ " + "\n⚠️ ".join(errors) if errors else "")
         return msg, al.load_library(), ecom_product_note()
     except Exception as e:
@@ -1080,6 +1085,7 @@ def ecom_save_item(kind, item_id, regen, headline, subline, badges, scene, text_
         it = ecom.find_item(plan, kind, item_id)
         if not it:
             return "⚠️ 找不到这张图，请重新策划", gr.skip()
+        cat = ecom.plan_category(plan)       # 这类目的生成策略：图标、版式、素材匹配都按它
         lines = [l.strip() for l in (badges or "").splitlines() if l.strip()]
         tag = (tag or "").strip()
         layout_note = ""
@@ -1091,9 +1097,9 @@ def ecom_save_item(kind, item_id, regen, headline, subline, badges, scene, text_
             old_share = ecom.detail_share(it)
             it.update(title=headline.strip(), body=subline.strip(), bullets=lines[:4], tag=tag,
                       specs=ecom.normalize_specs(specs or ""), compare=ecom.normalize_compare(compare or ""))
-            it["icons"] = ecom.fill_icons(it.get("icons"), it["bullets"])
+            it["icons"] = ecom.fill_icons(it.get("icons"), it["bullets"], cat)
             wanted = layout if layout in ecom.DETAIL_LAYOUTS else "standard"
-            it["layout"] = ecom.normalize_layout(wanted, it)
+            it["layout"] = ecom.normalize_layout(wanted, it, cat)
             if it["layout"] != wanted:
                 layout_note = f"\n💡 内容不够「{ecom.DETAIL_LAYOUTS[wanted]}」用（步骤和网格至少 2 条要点，对比表至少 1 行），已按标准版式排"
             if ecom.detail_share(it) > old_share and _ready(it.get("base_path")) and not regen:
@@ -1105,7 +1111,7 @@ def ecom_save_item(kind, item_id, regen, headline, subline, badges, scene, text_
             content, mode = (asset_content or ""), (asset_mode or "")
             if content != (old.get("content") or "") or mode != (old.get("mode") if old.get("source") == "user" else "") \
                     or (kind == "detail" and shot and shot != it.get("shot")):
-                ecom.set_item_asset(it, lib, content, mode, shot or "", main=kind == "main")
+                ecom.set_item_asset(it, lib, content, mode, shot or "", main=kind == "main", cat=cat)
                 layout_note += f"\n🖼 素材已改为：{al.asset_note(it['assets'], lib)}"
                 if it["assets"]["mode"] != "photo" and not regen:
                     layout_note += "\n💡 换了素材或拍法，点「重新生成画面」后生效"
@@ -1158,10 +1164,10 @@ def ecom_item_upload(kind, item_id, file):
         if not entry:
             return "⚠️ " + "；".join(skipped), gr.skip(), gr.skip(), gr.skip()
         if added:
-            need = al.role_need(it.get("role", ""), kind == "main")
+            need = al.role_need(it.get("role", ""), kind == "main", ecom.plan_category(plan))
             al.update_photo(entry["id"], type=(it.get("assets") or {}).get("missing") or need["types"][0])
             lib = al.load_library()
-        a = ecom.set_item_asset(it, lib, entry["id"], "", "", main=kind == "main")
+        a = ecom.set_item_asset(it, lib, entry["id"], "", "", main=kind == "main", cat=ecom.plan_category(plan))
         ecom.save_plan(plan)
         e = al.find(lib, entry["id"])
         msg = (f"📥 {item_id} 的参考照片：{al.describe(e)}（类型不对就到「③ 产品素材库」改）\n"

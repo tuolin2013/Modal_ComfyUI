@@ -44,6 +44,7 @@ from markupsafe import Markup
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps, ImageStat
 
 import asset_library as al
+import categories
 import html_render
 import category_playbook as cp
 import positioning as pos
@@ -121,6 +122,9 @@ ICONS = {
     "truck": '<path d="M3 6h11v10H3z"/><path d="M14 9h4l3 3v4h-7"/><circle cx="7" cy="17" r="2"/>'
              '<circle cx="17" cy="17" r="2"/>',
     "star": '<path d="M12 3l2.6 5.6 6 .7-4.5 4.1 1.2 6-5.3-3-5.3 3 1.2-6L3.4 9.3l6-.7z"/>',
+    "paw": '<ellipse cx="12" cy="15.5" rx="4.3" ry="3.5"/><circle cx="6.6" cy="10" r="2"/>'
+           '<circle cx="10.1" cy="6.3" r="2"/><circle cx="14.1" cy="6.3" r="2"/>'
+           '<circle cx="17.6" cy="10" r="2"/>',
     "check": '<circle cx="12" cy="12" r="9"/><path d="M8 12l3 3 5-6"/>',
 }
 # 没有指定图标时按文字猜（顺序即优先级）
@@ -134,17 +138,17 @@ ICON_KEYWORDS = (
 )
 
 
-def guess_icon(text: str) -> str:
-    for pattern, name in ICON_KEYWORDS:
+def guess_icon(text: str, cat=None) -> str:
+    for pattern, name in tuple(getattr(cat, "icon_rules", ()) or ()) + ICON_KEYWORDS:
         if re.search(pattern, str(text or "")):
             return name
     return "check"
 
 
-def fill_icons(icons, bullets: list[str]) -> list[str]:
-    """每条要点一个图标：给定的不在白名单里就按文字猜"""
+def fill_icons(icons, bullets: list[str], cat=None) -> list[str]:
+    """每条要点一个图标：给定的不在白名单里就按文字猜（类目自己的规则优先）"""
     icons = list(icons or [])
-    return [icons[k] if k < len(icons) and icons[k] in ICONS else guess_icon(b) for k, b in enumerate(bullets)]
+    return [icons[k] if k < len(icons) and icons[k] in ICONS else guess_icon(b, cat) for k, b in enumerate(bullets)]
 
 
 def normalize_compare(value) -> dict:
@@ -194,19 +198,27 @@ def compare_text(value) -> str:
     return "\n".join(["｜".join(cmp["headers"])] + [f"{r['name']}｜{r['left']}｜{r['right']}" for r in cmp["rows"]])
 
 
-def default_layout(role: str) -> str:
+def category_for(key: str | None):
+    """这类目手册的主图 / 详情页生成策略（categories.Category，没专属策略时返回 GENERIC）"""
+    return cp.category(key)
+
+
+def default_layout(role: str, cat=None) -> str:
     if "对比" in str(role):
         return "compare"
-    if re.search(r"方法|步骤|流程|冲泡", str(role)):
+    steps = r"方法|步骤|流程"
+    if cat is not None and getattr(cat, "step_pattern", ""):
+        steps = f"{steps}|{cat.step_pattern}"
+    if re.search(steps, str(role)):
         return "steps"
     return "standard"
 
 
-def normalize_layout(value, item: dict) -> str:
+def normalize_layout(value, item: dict, cat=None) -> str:
     """版式与内容不匹配时退回标准版式（如选了对比表却没有对比行、流程只有 1 步）"""
     layout = str(value or "").strip().lower()
     if layout not in DETAIL_LAYOUTS:
-        layout = default_layout(item.get("role", ""))
+        layout = default_layout(item.get("role", ""), cat)
     if layout in ("steps", "grid") and len(item.get("bullets") or []) < 2:
         return "standard"
     if layout == "compare" and not (item.get("compare") or {}).get("rows"):
@@ -537,7 +549,7 @@ def edit_image(prompt: str, ref_paths: list[str], out_path: Path, ratio: str, mo
 
 
 # ── 图文策划 ──────────────────────────────────────────────────────────────────
-PLAN_SYSTEM = """\
+_PLAN_TEMPLATE = """\
 你是资深电商视觉策划兼文案，熟悉淘宝/天猫、拼多多、微信小店的主图与详情页。
 目标：主图提高搜索点击率，详情页提高转化率，并严格遵守《广告法》。
 详情页每屏是一张 3:4 竖图，用户在手机上逐屏下滑浏览。
@@ -580,12 +592,11 @@ PLAN_SYSTEM = """\
 5. 需要真人出镜时，在 use_characters 中填角色 id，并在 scene_prompt_en 中描述此人的动作和位置，不描述长相。
 6. 15 屏详情页的画面要有变化（特写、场景、平铺、手持、局部），但色调统一，像同一套设计。
 7. 场景图要有代入感：按目标人群画像写具体的地点、时间、光线和 2-3 个真实道具
-   （如 "a home office desk at 3 pm, overcast window light, a laptop and a stack of papers"），
-   画面像买家自己的生活而不是样板间；有人物时写普通人的日常动作（低头吹热气、单手拿杯），不对镜头摆拍。
+   （如 "{scene_example}"），
+   画面像买家自己的生活而不是样板间；有人物时写普通人的日常动作（{action_example}），不对镜头摆拍。
    手持 / 第一人称视角（POV）的画面最容易让人代入。
 8. art_direction：整套图共用的视觉设定（英文，≤ 60 词）：主光、台面 / 背景材质与色系、2-3 个反复出现的道具、
-   镜头质感（如 "soft morning window light from the left; pale oak tabletop and warm off-white linen;
-   recurring props: a clear glass mug, a small bamboo tray; 50mm lens, shallow depth of field, gentle film grain"）。
+   镜头质感（如 "{art_example}"）。
    系统会把它拼进每一张图的提示词，所以各张的 scene_prompt_en 不要和它矛盾，也不用重复它。
    场景图不要出现医院、医生、药品、病床，也不要表现生病难受的人。
 9. 详情页每屏后面【】里是程序按商家的实拍素材分配好的出图方式和拍法，照着写：
@@ -610,6 +621,24 @@ PLAN_SYSTEM = """\
   ]
 }
 """.replace("{icon_names}", " / ".join(ICONS))
+
+
+def category_prompt_block(cat=None) -> str:
+    """策划输入里的【本类目画面要求】：与生图提示词用同一份类目要求，免得 LLM 写出矛盾的画面描述"""
+    rules = [str(r).strip() for r in (getattr(cat, "image_rules", ()) or ()) if str(r).strip()]
+    return "【本类目画面要求】" + " ".join(rules) if rules else ""
+
+
+def plan_system(cat=None) -> str:
+    """图文策划的提示词：场景 / 动作 / 视觉设定的示例由类目提供，没写的用通用示例"""
+    cat = categories.GENERIC if cat is None else cat
+    return (_PLAN_TEMPLATE
+            .replace("{scene_example}", cat.scene_example)
+            .replace("{action_example}", cat.action_example)
+            .replace("{art_example}", cat.art_example))
+
+
+PLAN_SYSTEM = plan_system()          # 通用版；生成时用 plan_system(类目)
 
 
 def generate_ecom_plan(
@@ -637,16 +666,18 @@ def generate_ecom_plan(
                  画面方向和价格策略
     """
     spec = ECOM_PLATFORMS.get(platform, ECOM_PLATFORMS[DEFAULT_ECOM_PLATFORM])
+    cat = category_for(playbook)
     main_count = int(main_count) if int(main_count) in MAIN_COUNTS else MAIN_COUNTS[0]
     main_ratio = main_ratio if main_ratio in MAIN_RATIOS else MAIN_RATIOS[0]
-    roles = spec["main_roles"][:main_count]
+    # 平台决定主图有哪几张，类目决定每张拍什么（如莓茶首图照实拍画白霜，宠物补充剂首图放宠物进食）
+    roles = cat.main_roles(platform, spec["main_roles"])[:main_count]
     position = pos.resolve(positioning, platform)
     detail_roles_list = pos.detail_roles(cp.detail_roles(DETAIL_ROLES, playbook), position,
                                          cp.get(playbook).get("positioning_plans"))
     lib = al.load_library() if library is None else library
-    assets = al.assign(detail_roles_list, lib) if lib else None
-    main_assets = al.assign(roles, lib, main=True) if lib else None
-    shots = al.plan_shots(detail_roles_list, assets)
+    assets = al.assign(detail_roles_list, lib, cat=cat) if lib else None
+    main_assets = al.assign(roles, lib, main=True, cat=cat) if lib else None
+    shots = al.plan_shots(detail_roles_list, assets, cat)
     characters = characters or []
     char_ids = {c["id"] for c in characters}
     main_roles = "\n".join(
@@ -667,6 +698,7 @@ def generate_ecom_plan(
 {product_context}
 {cp.prompt_block(playbook, "ecom")}
 {pos.prompt_block(position, "ecom")}
+{category_prompt_block(cat)}
 目标平台：{platform}
 平台特点：{spec['guide']}
 
@@ -681,18 +713,19 @@ def generate_ecom_plan(
 """
 
     def build(raw_plan):
-        p = attach_assets(_normalize_plan(raw_plan, roles, main_ratio, char_ids, detail_roles_list), assets, shots,
-                          main_assets)
+        p = attach_assets(_normalize_plan(raw_plan, roles, main_ratio, char_ids, detail_roles_list, cat), assets,
+                          shots, main_assets)
         pos.apply_price_policy(p["main_images"], position)
         return p
 
-    raw = _chat_json(PLAN_SYSTEM, user)
+    system = plan_system(cat)
+    raw = _chat_json(system, user)
     plan = build(raw)
     issues = review_plan(plan, usp, playbook, raw.get("art_direction"), lib, product_context)
     reviewed = False
     if self_review:
         try:
-            revised = _chat_json(PLAN_SYSTEM, user, history=[
+            revised = _chat_json(system, user, history=[
                 {"role": "assistant", "content": json.dumps(raw, ensure_ascii=False)},
                 {"role": "user", "content": qc.revision_request(qc.ECOM_RUBRIC, issues)},
             ], temperature=0.4)
@@ -776,12 +809,13 @@ def check_assets(plan: dict, lib: list[dict] | None = None) -> list[str]:
     return issues
 
 
-def reassign_assets(plan: dict, lib: list[dict], keep_manual: bool = True) -> dict:
+def reassign_assets(plan: dict, lib: list[dict], keep_manual: bool = True, cat=None) -> dict:
     """
     素材库变了（补拍、改类型、删图）后重新分配详情页素材和拍法，文案不动。
     keep_manual：卡片上手动指定过的屏（source = user）保持不变，且素材还在库里
     返回 {"changed": [屏 id], "issues": [...]}；换了素材的屏下次生成时会重出底图（见 needs_regen）
     """
+    cat = plan_category(plan) if cat is None else cat
     details = plan.get("detail_sections", [])
     roles = [d["role"] for d in details]
     ids = {e["id"] for e in lib}
@@ -794,7 +828,8 @@ def reassign_assets(plan: dict, lib: list[dict], keep_manual: bool = True) -> di
     changed = []
     mains = [m for m in plan.get("main_images", []) if not m.get("white_bg")]
     fixed = manual(mains)
-    main_assets = al.assign([m["role"] for m in mains], lib, fixed=fixed, main=True) if lib else [None] * len(mains)
+    main_assets = (al.assign([m["role"] for m in mains], lib, fixed=fixed, main=True, cat=cat) if lib
+                   else [None] * len(mains))
     for i, m in enumerate(mains):
         if i in fixed:
             continue
@@ -807,8 +842,8 @@ def reassign_assets(plan: dict, lib: list[dict], keep_manual: bool = True) -> di
             changed.append(m["id"])
 
     fixed = manual(details)
-    assets = al.assign(roles, lib, fixed=fixed) if lib else [None] * len(details)
-    shots = al.plan_shots(roles, assets)
+    assets = al.assign(roles, lib, fixed=fixed, cat=cat) if lib else [None] * len(details)
+    shots = al.plan_shots(roles, assets, cat)
     for i, d in enumerate(details):
         old = (d.get("assets") or {}).get("refs"), (d.get("assets") or {}).get("mode"), d.get("shot")
         if i not in fixed:
@@ -835,12 +870,12 @@ def sync_assets(plan: dict, lib: list[dict]) -> dict | None:
 
 
 def set_item_asset(item: dict, lib: list[dict], content_id: str = "", mode: str = "", shot: str = "",
-                   main: bool = False) -> dict:
+                   main: bool = False, cat=None) -> dict:
     """
     卡片上手动改这一屏：内容照片（"" = 不指定）、出图方式（"" = 自动）、拍法。记为 source = user，
-    重新分配素材时保持不变。main：主图（不实拍直出、没有拍法）
+    重新分配素材时保持不变。main：主图（不实拍直出、没有拍法）；cat：类目（决定这屏要哪类照片）
     """
-    need = al.role_need(item.get("role", ""), main)
+    need = al.role_need(item.get("role", ""), main, cat)
     content = al.find(lib, content_id) if content_id else None
     if main and mode == "photo":
         mode = ""
@@ -958,7 +993,7 @@ def plan_color(plan: dict) -> tuple[int, int, int]:
 
 
 def _normalize_plan(raw: dict, roles: list[str], main_ratio: str, char_ids: set,
-                    detail_roles: list[str] | None = None) -> dict:
+                    detail_roles: list[str] | None = None, cat=None) -> dict:
     raw_mains = raw.get("main_images") if isinstance(raw.get("main_images"), list) else []
     raw_details = raw.get("detail_sections") if isinstance(raw.get("detail_sections"), list) else []
     detail_roles = detail_roles or DETAIL_ROLES
@@ -997,14 +1032,14 @@ def _normalize_plan(raw: dict, roles: list[str], main_ratio: str, char_ids: set,
             "title": clean_text(it.get("title"), 24),
             "body": clean_text(it.get("body"), 80),
             "bullets": bullets,
-            "icons": fill_icons(_str_list(it.get("icons"), 4), bullets),
+            "icons": fill_icons(_str_list(it.get("icons"), 4), bullets, cat),
             "specs": normalize_specs(it.get("specs")),
             "compare": normalize_compare(it.get("compare")),
             "use_characters": [c for c in _str_list(it.get("use_characters"), 2) if c in char_ids],
             "scene_prompt_en": str(it.get("scene_prompt_en", "")).strip(),
             "base_path": "", "final_path": "",
         }
-        d["layout"] = normalize_layout(it.get("layout"), d)
+        d["layout"] = normalize_layout(it.get("layout"), d, cat)
         details.append(d)
     return {"main_images": mains, "detail_sections": details}
 
@@ -1061,17 +1096,26 @@ def product_slots(extra: int = 3) -> list[tuple[int, str, str]]:
 
 # ── 素材自动分类：视觉模型给每张照片打类型；包装背面顺带读出标签字段 ─────────────────
 TAG_BATCH = 6          # 每次调用最多送几张（图越多越容易漏答、错位）
-TAG_SYSTEM = f"""\
+_TAG_TEMPLATE = f"""\
 你是电商美工助理。用户上传了同一个商品的多张照片，请逐张判断类型。类型只能从下面选（填英文 key）：
 {al.tag_guide()}
 
 规则：
 1. 一张照片只给一个最主要的类型。包装正面清晰可见时优先判为 package_front，即使背景是生活场景。
-2. note：用中文写这张照片的内容，≤ 12 字（如「玻璃杯里的琥珀色茶汤」「三袋装礼盒」）。
+2. note：用中文写这张照片的内容，≤ 12 字（如 {{note_example}}）。
 3. 判为 package_back 的照片，把能看清的标签信息抄进 label_fields（照抄原文，看不清的项不写，绝不推测）：
    可能有的项：产品名称、配料 / 原料组成、添加剂组成、净含量、规格、保质期、贮存条件、生产日期、
    生产许可证编号、执行标准、产地、生产商、适用对象、用法用量、成分分析保证值。其它类型的照片 label_fields 为 {{}}。
 只输出 JSON：{{"photos": [{{"index": 1, "type": "...", "note": "...", "label_fields": {{}}}}]}}，index 是照片序号（从 1 起）。"""
+
+
+def tag_system(cat=None) -> str:
+    """照片自动分类的提示词：note 的示例按类目给（莓茶说茶汤，宠物补充剂说宠物进食）"""
+    note = (cat.note_example if cat is not None else "") or "「玻璃杯里的琥珀色茶汤」「三袋装礼盒」"
+    return _TAG_TEMPLATE.replace("{note_example}", note)
+
+
+TAG_SYSTEM = tag_system()            # 通用版；识别时用 tag_system(类目)
 
 
 def classify_photos(entries: list[dict], model: str = "") -> tuple[int, list[str]]:
@@ -1223,7 +1267,7 @@ def _ai_text_block(item: dict, kind: str, brand_hex: str) -> list[str]:
 
 def build_edit_prompt(item: dict, kind: str, n_product: int, chars: list[dict],
                       text_mode: str = DEFAULT_TEXT_MODE, brand_hex: str = "", art_direction: str = "",
-                      refs: list[dict] | None = None, content_id: str = "") -> str:
+                      refs: list[dict] | None = None, content_id: str = "", cat=None) -> str:
     """
     art_direction：整套图共用的视觉设定（plan.meta.art_direction），白底图不用
     refs：素材库里分配给这一屏的参考图条目（包装在前）。None 时按旧方式把 n_product 张都当产品图；
@@ -1240,7 +1284,7 @@ def build_edit_prompt(item: dict, kind: str, n_product: int, chars: list[dict],
             lines.append(f"Reference images 1-{n_product} show the same real product from different angles.")
         has_product = True
     else:
-        lines += _ref_lines(refs, content_id)
+        lines += _ref_lines(refs, content_id, cat)
         n_product = len(refs)
         has_product = any(_is_product_ref(r, content_id) for r in refs)
     if has_product:
@@ -1264,6 +1308,8 @@ def build_edit_prompt(item: dict, kind: str, n_product: int, chars: list[dict],
         if al.shot_prompt(item.get("shot", "")):
             lines.append(f"Shot type: {al.shot_prompt(item['shot'])}.")
         lines.append(item.get("scene_prompt_en", ""))
+        if cat is not None:
+            lines += list(getattr(cat, "image_rules", ()) or ())
         purpose = "the typeset text below" if ai_text else "a text overlay"
         if kind == "main":
             area = "top" if item.get("text_position") != "bottom" else "bottom"
@@ -1299,19 +1345,23 @@ def _is_product_ref(r: dict, content_id: str = "") -> bool:
 _KEEP_SCENE_TYPES = {"raw_material", "lifestyle"}
 
 
-def _ref_lines(refs: list[dict], content_id: str = "") -> list[str]:
+def _ref_lines(refs: list[dict], content_id: str = "", cat=None) -> list[str]:
     """
     逐张说明参考图是什么、怎么用：包装图锁外观；内容照片里的东西照着画、不凭空捏造，
-    产品类内容（干茶、茶汤、叶底）可以换角度和构图，原料 / 产地这类环境照片保留真实环境
+    产品类内容（干茶、茶汤、叶底）可以换角度和构图，原料 / 产地这类环境照片保留真实环境。
+    每张照片怎么描述由类目决定（如宠物补充剂的「使用中」是宠物进食），没写的用通用说明
     """
+    keep_scene = getattr(cat, "keep_scene_types", None)
+    keep_scene = _KEEP_SCENE_TYPES if keep_scene is None else keep_scene
     lines = []
     for k, r in enumerate(refs, 1):
-        what = al.PHOTO_TYPES.get(r.get("type"), al.PHOTO_TYPES[al.DEFAULT_TYPE])[1]
+        default = al.PHOTO_TYPES.get(r.get("type"), al.PHOTO_TYPES[al.DEFAULT_TYPE])[1]
+        what = cat.photo_desc(r.get("type"), default) if cat is not None else default
         if r.get("type") in al.PACKAGE_TYPES:
             lines.append(f"Reference image {k} shows {what}.")
         elif _is_product_ref(r, content_id):
             lines.append(f"Reference image {k} is a real photo of the product as sold (its packaging and appearance).")
-        elif r.get("type") in _KEEP_SCENE_TYPES:
+        elif r.get("type") in keep_scene:
             lines.append(f"Reference image {k} is a real photo of {what}. Depict this real place, its plants, objects "
                          "and colors faithfully; you may change the framing and light for the shot described below, "
                          "but do not invent a different place or different-looking plants.")
@@ -1331,6 +1381,7 @@ def render_item(plan: dict, kind: str, item: dict, product_paths: list[str], por
     """
     text_mode = text_mode if text_mode in TEXT_MODES else DEFAULT_TEXT_MODE
     lib = al.load_library() if library is None else library
+    cat = plan_category(plan)
     mode, refs = _resolve_refs(item, kind, lib)
     a = item.get("assets") or {}
     if a.get("needs_photo") and mode != "photo":
@@ -1341,7 +1392,7 @@ def render_item(plan: dict, kind: str, item: dict, product_paths: list[str], por
     if mode == "photo":
         item["base_path"] = str(photo_base(item, kind, refs[0]["path"], out))
         item["base_mode"], item["base_key"] = "photo", asset_key(item, kind, lib)
-        return compose_item(plan, kind, item)
+        return compose_item(plan, kind, item, cat)
     chars = [portraits[c] for c in item.get("use_characters", []) if c in portraits]
     paths = product_paths[:MAX_PRODUCT_REFS] if refs is None else [e["path"] for e in refs]
     if not paths and mode != "generate":
@@ -1349,13 +1400,13 @@ def render_item(plan: dict, kind: str, item: dict, product_paths: list[str], por
     brand_hex = _hex(plan_color(plan))
     art = (plan.get("meta") or {}).get("art_direction", "")
     prompt = build_edit_prompt(item, kind, len(paths), chars, text_mode, brand_hex, art, refs,
-                               (item.get("assets") or {}).get("content") or "")
+                               (item.get("assets") or {}).get("content") or "", cat)
     base = edit_image(prompt, paths + [c["image_path"] for c in chars], out, item.get("ratio", "1:1"),
                       allow_empty=mode == "generate")
     item["base_path"] = str(base)
     item["base_mode"] = text_mode
     item["base_key"] = asset_key(item, kind, lib)
-    return compose_item(plan, kind, item)
+    return compose_item(plan, kind, item, cat)
 
 
 class NeedsPhoto(Exception):
@@ -1734,7 +1785,7 @@ def _text_zone(kind: str, item: dict, W: int, H: int) -> tuple[str, tuple, int]:
     return "top", (0, 0, W, int(H * share)), int(H * (share + 0.05))
 
 
-def _template_data(kind: str, item: dict, img: Image.Image, accent) -> dict:
+def _template_data(kind: str, item: dict, img: Image.Image, accent, cat=None) -> dict:
     """plan 里的文案 → 模板变量（文字原样交给模板，由 Jinja2 自动转义）"""
     W, H = img.size
     position, box, zone_max = _text_zone(kind, item, W, H)
@@ -1757,7 +1808,7 @@ def _template_data(kind: str, item: dict, img: Image.Image, accent) -> dict:
     layout = item.get("layout") if item.get("layout") in DETAIL_LAYOUTS else "standard"
     # 信息图：步骤由模板自动编号；图标只从白名单 ICONS 取（开发者写的固定 SVG，不含 LLM 文本），
     # 所以可以标记为安全 HTML 原样嵌入，文案仍由 Jinja2 自动转义
-    icons = fill_icons(item.get("icons"), [b["text"] for b in bullets])
+    icons = fill_icons(item.get("icons"), [b["text"] for b in bullets], cat)
     data.update(title=clean_text(item.get("title"), 200), body=clean_text(item.get("body"), 400),
                 bullets=bullets, bullet_cols=2 if short else 1, specs=normalize_specs(item.get("specs")),
                 layout=layout, compare=normalize_compare(item.get("compare")),
@@ -1768,7 +1819,7 @@ def _template_data(kind: str, item: dict, img: Image.Image, accent) -> dict:
 _fallback_noted = False
 
 
-def _compose(kind: str, item: dict, brand, out: Path) -> Path:
+def _compose(kind: str, item: dict, brand, out: Path, cat=None) -> Path:
     """HTML 模板排版；Playwright / Chromium 不可用或出错时退回 Pillow 简版排版。排版提示写进 item"""
     global _fallback_noted
     img = _load_base(item)
@@ -1780,7 +1831,7 @@ def _compose(kind: str, item: dict, brand, out: Path) -> Path:
     reason = ""
     if RENDERER != "pil":
         try:
-            final, warnings = html_render.render(f"{kind}.html", _template_data(kind, item, img, brand), img)
+            final, warnings = html_render.render(f"{kind}.html", _template_data(kind, item, img, brand, cat), img)
             item["layout_warnings"], item["renderer"] = warnings + ([clutter] if clutter else []), "html"
             return _save_final(final, out)
         except html_render.RendererUnavailable as e:
@@ -1801,12 +1852,12 @@ def _compose(kind: str, item: dict, brand, out: Path) -> Path:
     return out
 
 
-def compose_main(item: dict, brand, out: Path) -> Path:
-    return _compose("main", item, brand, out)
+def compose_main(item: dict, brand, out: Path, cat=None) -> Path:
+    return _compose("main", item, brand, out, cat)
 
 
-def compose_detail(item: dict, brand, out: Path) -> Path:
-    return _compose("detail", item, brand, out)
+def compose_detail(item: dict, brand, out: Path, cat=None) -> Path:
+    return _compose("detail", item, brand, out, cat)
 
 
 # ── Pillow 简版排版（无 Chromium 时的兜底）─────────────────────────────────────
@@ -1887,19 +1938,25 @@ def _pil_compose_detail(item: dict, brand, out: Path, img: Image.Image) -> Path:
     return _save_final(img, out)
 
 
-def compose_item(plan: dict, kind: str, item: dict) -> str:
+def plan_category(plan: dict):
+    """策划文件对应的生成策略（plan.meta.playbook → categories.Category）"""
+    return category_for((plan.get("meta") or {}).get("playbook"))
+
+
+def compose_item(plan: dict, kind: str, item: dict, cat=None) -> str:
     """只重排文字（改字后用，不重新调用生图接口）"""
     if not (item.get("base_path") and os.path.exists(item["base_path"])):
         raise FileNotFoundError(f"{item['id']} 还没有底图，请先生成")
     brand = plan_color(plan)
+    cat = cat if cat is not None else plan_category(plan)
     out = FINAL_DIR / final_filename(kind, item)
     if item.get("base_mode") == "ai":
         # AI 已把文字画进图里，只裁切缩放到成品尺寸，不再叠字
         item["layout_warnings"], item["renderer"] = [], ""
         out = _save_final(_load_base(item), out)
     elif kind == "main":
-        out = compose_main(item, brand, out)
+        out = compose_main(item, brand, out, cat)
     else:
-        out = compose_detail(item, brand, out)
+        out = compose_detail(item, brand, out, cat)
     item["final_path"] = str(out)
     return str(out)
